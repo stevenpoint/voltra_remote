@@ -4,5 +4,3 @@
 __pycache__/
 # preview written by tools/gen_icons.py --preview
 icons.png
-# local tool binaries, not part of the project
-tools/arduino-cli.exe
