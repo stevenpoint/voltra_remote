@@ -19,63 +19,126 @@ Beyond-Power-HomeAssistant / Beyond-Power-Voltra-Android and jpamorgan's voltra-
 | Hold the weight | Voltra auto load (pull and hold the cable, 3 s countdown) |
 | Tap again on "CABLE OUT: TAP TO OVERRIDE" | Load at once with the cable pulled out |
 | Swipe up / down | Weight +/- 1 lb, 5 lb steps when swiping fast |
-| Connect screen: "Twin with ..." | Twin two Voltras (see Twin mode) |
+| Gear button | Eccentric, chains, inverse chains, mountain |
+| Tap the Bluetooth bar at the top | Connect screen: pick a Voltra, twin, un-twin |
 
-Close **Beyond+** before connecting. The trainer only keeps one controller.
+The tick marks around the screen edge show the weight; they turn green while loaded.
 
-## Hardware
+## What you need
 
-- Waveshare ESP32-S3-Touch-AMOLED-2.06 (S3, **not** C6)
-- Optional: EEMB 402535 320 mAh MX1.25 pouch in the back
-- Strap the watch to the bar so the screen faces you
+- Waveshare **ESP32-S3-Touch-AMOLED-2.06** (the ESP32-S3 version, not the C6)
+- A USB-C data cable
+- Optional: a 3.7 V LiPo with an MX1.25 plug for running unplugged (for example an
+  EEMB 402535, 320 mAh)
+- A Mac, Linux or Windows computer
 
-## Friday bring-up (do this first)
+## Load it onto a new watch
 
-Do **not** flash Voltra firmware until the stock panel works.
+### 1. Install PlatformIO
 
-1. Install Arduino IDE or `arduino-cli` + esp32 core **3.3.x**.
-2. Clone Waveshare examples:
-   `git clone https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-2.06.git`
-3. Open `examples/arduino/01_HelloWorld` and `06_LVGL_Arduino_v9`.
-4. Board: **ESP32S3 Dev Module**, USB CDC on Boot = Enabled, PSRAM = OPI PSRAM, Flash 16 MB or whatever the listing says (this SKU is 32 MB on many units — if flash fails, try 16 MB).
-5. Hold **BOOT**, plug USB-C, release BOOT after the port appears if the Mac/PC does not see it.
-6. Confirm: white screen + Hello World, then LVGL widgets + touch.
-
-Only after that, open `firmware/VoltraWatch`.
-
-## Firmware layout
+Either the [PlatformIO extension for VS Code](https://platformio.org/install/ide?install=vscode),
+or the command line:
 
 ```
-firmware/VoltraWatch/
-  VoltraWatch.ino     // setup / loop
-  pin_config.h        // 2.06 GPIO map
-  gestures.h/.cpp     // tap / swipe
-  ui.h/.cpp           // big weight + state
-  link.h/.cpp         // BLE client — copy protocol from voltra-knob
+brew install platformio        # macOS
+pip install platformio         # anywhere with Python 3
 ```
 
-`link.cpp` is a stub until we drop in Omar Shahine’s `src/protocol` + `src/link` from
-https://github.com/omarshahine/voltra-knob
+### 2. Get the code
 
-Those files are host-tested C++ and do not care about the encoder. We keep his frames and swap the board/UI layer.
+```
+git clone https://github.com/stevenpoint/voltra_remote.git
+cd voltra_remote
+```
 
-## Safety
+### 3. Flash the watch
 
-- Never auto-load on boot.
-- Cap live weight changes (default 25 lb while loaded).
-- If BLE drops mid-set, do not guess; show DISCONNECTED and leave the trainer as-is.
-- Printed straps and plastic are not a failsafe. Unload from the Voltra face if anything feels wrong.
+Plug the watch in over USB-C, then:
+
+```
+pio run -e watch206 -t upload
+```
+
+The first build downloads the ESP32 toolchain and libraries, which takes a few minutes.
+The watch restarts into the remote when the upload finishes.
+
+If the upload cannot find the watch, hold the **BOOT** button while plugging it in, release
+it once the port appears, and upload again.
+
+Use only the `watch206` build on the watch. The `remote` build is for the knob and uses
+different pins (GPIO 8 is the watch's display reset).
+
+### 4. Fit the battery (optional)
+
+**Check the polarity before plugging a battery in.** The red wire must go to the **+** pad
+marked on the board. Aftermarket batteries with the same plug are sometimes wired the other
+way round; a reversed battery is not detected and the watch will not run unplugged (and it
+risks damaging the board).
+
+The watch charges the battery over USB-C. Its level shows at the bottom of the screen.
+
+### 5. Connect to your Voltra
+
+1. Close **Beyond+** on your phone first. The Voltra only keeps one controller.
+2. On the watch, tap the Bluetooth bar at the top to open the Connect screen.
+3. Tap your Voltra (`VTR-...`) in the list.
+
+The watch remembers it and reconnects by itself next time. The watch never loads the
+Voltra on its own: at start-up it only connects.
 
 ## Twin mode
 
-Twin the Voltras **from the remote**, not from the Voltras' own screens: a hosting Voltra
+Twin the Voltras **from the watch**, not from the Voltras' own screens: a hosting Voltra
 stops advertising, so a remote can only drive the pair over a connection it made before
 twinning (the way Beyond+ does it; see `docs/PROTOCOL.md`, "Twin mode").
 
 1. Connect to the Voltra that should host.
 2. Open the Connect screen and tap **Twin with VTR-...** under the other Voltra.
-3. The top bar shows **TWIN**; weight, load and unload now drive both.
+3. The top bar shows **TWIN**; weight, load, unload and the cable-out override now drive
+   both, and the weight shows the pair's total.
 4. **Un-twin** on the Connect screen undoes it.
 
-If the remote loses the host while twinned it cannot reconnect until the pair is
+If the watch loses the host while twinned it cannot reconnect until the pair is
 un-twinned on the Voltras.
+
+## Safety
+
+- The watch only loads when you tap, hold or confirm the override. It never loads on
+  start-up or after reconnecting.
+- If Bluetooth drops, the watch shows it is disconnected and leaves the Voltra as it is.
+- The cable-out override loads at once with the cable pulled out, skipping the Voltra's own
+  hold-still check. Use it with a firm grip.
+- Straps and printed parts are not a failsafe. Unload from the Voltra itself if anything
+  feels wrong.
+
+## Code layout
+
+```
+src/main.cpp              start-up
+src/hw/                   display (display_watch206.cpp on the watch), touch, battery,
+                          knob (swipes stand in for it on the watch)
+src/ui/ui.cpp             screens; WATCH206 sections hold the watch layout
+src/voltra/               BLE client and protocol (voltra_protocol.* is host-tested)
+src/diag/flash_log.*      diagnostic builds: keeps the log in flash
+docs/PROTOCOL.md          the Voltra protocol, including cable-out and twin captures
+tools/                    font and icon generators, pull_log.py
+```
+
+Builds, from `platformio.ini`:
+
+| Build | For |
+|---|---|
+| `watch206` | The watch |
+| `watch206_diag` | The watch, logging all Voltra traffic to flash |
+| `watch206_sweep` | As `watch206_diag`, plus a full register read every ~40 s |
+| `remote` / `remote_diag` | The original knob |
+| `native` | Protocol unit tests: `pio test -e native` |
+
+To capture Voltra traffic away from a computer, flash `watch206_diag`, use the watch at
+the Voltra, then plug it back in and run:
+
+```
+~/.platformio/penv/bin/python tools/pull_log.py
+```
+
+This saves the log to `voltra_capture.log`; `--clear` wipes it from the watch afterwards.
