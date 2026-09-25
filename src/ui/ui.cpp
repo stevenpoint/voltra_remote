@@ -762,14 +762,21 @@ void refresh_main()
 
     // top bar: Bluetooth icon (blue when connected, white when not) and, once connected,
     // the Voltra's battery level. Recolour markup colours just the icon.
-    char top[64];
+    char top[96];
     const char *bt_hex = connected ? C_BT_HEX : C_WHITE_HEX;
+    auto battery_sym = [](int pct) {
+        return pct > 80 ? LV_SYMBOL_BATTERY_FULL : pct > 60 ? LV_SYMBOL_BATTERY_3
+             : pct > 40 ? LV_SYMBOL_BATTERY_2 : pct > 15 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
+    };
     if (connected && st.battery >= 0) {
-        const char *sym = st.battery > 80 ? LV_SYMBOL_BATTERY_FULL
-                        : st.battery > 60 ? LV_SYMBOL_BATTERY_3
-                        : st.battery > 40 ? LV_SYMBOL_BATTERY_2
-                        : st.battery > 15 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
-        snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#   %s %d%%", bt_hex, sym, st.battery);
+        snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#   %s %d%%", bt_hex, battery_sym(st.battery),
+                 st.battery);
+        if (st.twinned() && st.twin_peer_battery >= 0) {
+            // Twinned: the follower's battery after the host's.
+            const size_t n = strlen(top);
+            snprintf(top + n, sizeof(top) - n, "  %s %d%%", battery_sym(st.twin_peer_battery),
+                     st.twin_peer_battery);
+        }
     } else {
         snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#", bt_hex);
     }
@@ -995,7 +1002,11 @@ void build_main()
 #endif
 
     // top bar (tap -> connect menu)
+#ifdef WATCH206
+    ui.btn_top = make_flat_button(ui.scr_main, 300, 44);   // twinned it shows two batteries
+#else
     ui.btn_top = make_flat_button(ui.scr_main, 220, 44);
+#endif
     lv_obj_align(ui.btn_top, LV_ALIGN_TOP_MID, 0, TOP_BAR_Y);
     lv_obj_add_event_cb(ui.btn_top, on_top_clicked, LV_EVENT_CLICKED, nullptr);
     ui.lbl_top = make_label(ui.btn_top, &font_poppins_16, C_TEXT, "");
@@ -1353,7 +1364,8 @@ void rebuild_device_list()
         lv_obj_set_user_data(b, (void *)(intptr_t)i);
         lv_obj_set_style_text_color(b, C_TEXT, 0);
         lv_obj_add_event_cb(b, on_device_clicked, LV_EVENT_CLICKED, nullptr);
-        if (ready && st.twin_state == voltra::TWIN_STATE_ALONE) {
+        // Unknown (no twin status yet) counts as alone: the join works without it.
+        if (ready && st.twin_state <= voltra::TWIN_STATE_ALONE) {
             snprintf(buf, sizeof(buf), "Twin with %s", d.name.c_str());
             lv_obj_t *t = lv_list_add_btn(ui.list, LV_SYMBOL_LOOP, buf);
             lv_obj_set_user_data(t, (void *)(ROW_TWIN_BASE + (intptr_t)i));

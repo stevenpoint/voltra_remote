@@ -352,6 +352,21 @@ void test_twin_status_twinned()
     TEST_ASSERT_EQUAL_HEX8_ARRAY(peer, ts.peer, 6);
 }
 
+// The first byte is the battery %: this capture was at 53 % (0x35) rather than 57 %.
+void test_twin_status_other_battery()
+{
+    TwinStatus ts;
+    TEST_ASSERT_TRUE(twin_from_payload("35011280b54e0702a680b54e0742a235010000001617", ts));
+    TEST_ASSERT_EQUAL_INT(TWIN_STATE_TWINNED, ts.state);
+    // Host at 53 %, follower at 52 %.
+    TEST_ASSERT_TRUE(twin_from_payload("35011280b54e0702a680b54e0742a234010000001617", ts));
+    TEST_ASSERT_EQUAL_INT(52, ts.peer_battery);
+    TEST_ASSERT_TRUE(twin_from_payload("0035010080b54e0702a600000000000000010000001600", ts));
+    TEST_ASSERT_EQUAL_INT(TWIN_STATE_ALONE, ts.state);
+    TEST_ASSERT_EQUAL_HEX8(0x80, ts.own[0]);
+    TEST_ASSERT_EQUAL_INT(-1, ts.peer_battery);
+}
+
 void test_twin_status_short()
 {
     TwinStatus ts;
@@ -479,6 +494,7 @@ int main(int, char **)
     RUN_TEST(test_twin_status_alone);
     RUN_TEST(test_twin_status_twinned);
     RUN_TEST(test_twin_status_short);
+    RUN_TEST(test_twin_status_other_battery);
     RUN_TEST(test_twin_modes);
     RUN_TEST(test_slow_turn_stays_fine);
     RUN_TEST(test_fast_turn_becomes_coarse);

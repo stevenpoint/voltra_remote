@@ -327,20 +327,21 @@ bool parse_twin_status(const Packet &pkt, TwinStatus &out)
     if (pkt.cmd != CMD_TWIN_STATUS) return false;
     const uint8_t *p = pkt.payload;
     const size_t n = pkt.payload_len;
-    // Replies come both with and without a leading 00 status byte.
-    for (size_t k = 0; k <= 1; k++) {
-        if (n >= k + 3 && p[k] == 0x39 && p[k + 1] == 0x01) {
-            out = TwinStatus();
-            out.state = p[k + 2];
-            if (n >= k + 15) {
-                memcpy(out.own, p + k + 3, 6);
-                memcpy(out.peer, p + k + 9, 6);
-                out.has_addrs = true;
-            }
-            return true;
-        }
+    // `BB 01 SS ...`: BB is the unit's battery % (0x39 at 57 %, 0x35 at 53 %), so it
+    // cannot be matched on. A reply to a request has a leading 00 status byte; a push
+    // does not (23 vs 22 bytes). A battery byte is never 0, so a leading 0 not followed by
+    // 01 is status too, which also covers truncated replies.
+    const size_t k = (n >= 2 && p[0] == 0x00 && (p[1] != 0x01 || n == 23)) ? 1 : 0;
+    if (n < k + 3 || p[k + 1] != 0x01) return false;
+    out = TwinStatus();
+    out.state = p[k + 2];
+    if (n >= k + 15) {
+        memcpy(out.own, p + k + 3, 6);
+        memcpy(out.peer, p + k + 9, 6);
+        out.has_addrs = true;
     }
-    return false;
+    if (n >= k + 16 && p[k + 15] > 0 && p[k + 15] <= 100) out.peer_battery = p[k + 15];
+    return true;
 }
 
 int parse_activation(const Packet &pkt)

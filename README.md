@@ -102,12 +102,12 @@ twinning (the way Beyond+ does it; see `docs/PROTOCOL.md`, "Twin mode").
 
 1. Connect to the Voltra that should host.
 2. Open the Connect screen and tap **Twin with VTR-...** under the other Voltra.
-3. The top bar shows **TWIN**; weight, load, unload and the cable-out override now drive
-   both, and the weight shows the pair's total.
+3. The top bar shows **TWIN** and both Voltras' batteries (host first); weight, load,
+   unload and the cable-out override now drive both, and the weight shows the pair's total.
 4. **Un-twin** on the Connect screen undoes it.
 
-If the watch loses the host while twinned it cannot reconnect until the pair is
-un-twinned on the Voltras.
+If the watch loses the host while twinned it keeps retrying; reconnecting can take a
+minute or so, and if it does not, un-twin on the Voltras and set the twin up again.
 
 ## Safety
 

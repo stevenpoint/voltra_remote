@@ -247,9 +247,11 @@ The app connects to **both** units (normal handshake on each), then:
 2. The app **keeps its connection to the host**. A hosting unit stops advertising but keeps
    connections it already has, which is how the app can still drive it.
 3. The host reports the twin unprompted. Command `0xA7` (twin status, empty request) answers
-   `39 01 SS <own addr> <peer addr> ...`: `SS` = `00` alone, `11` then `12` once the
-   follower is in, with the follower's address as peer. It also pushes `0x521F` =
-   `01 39 00 02`.
+   `BB 01 SS <own addr> <peer addr> ...`, with a leading `00` status byte when it is a reply
+   rather than a push. `BB` is the unit's battery % (`39` at 57 %, `35` at 53 %), not a
+   fixed marker. `SS` = `00` alone, `11` then `12` once the follower is in, with the
+   follower's address as peer. The byte after the peer address is the follower's battery %
+   (`34` with the host at `35`; `00` when alone). It also pushes `0x521F` = `01 BB 00 02`.
 4. `0xA9 01` / `0xA9 03` to the host return the follower's name (`VTR-066162`) and serial:
    queries, not part of the setup.
 
@@ -261,6 +263,9 @@ Driving the pair, everything to the host:
 - While loaded the app sends `0xAA 13 01` every 0.5 s (answered `00 13 00`); purpose unknown.
 
 Un-twin: to the host, `0xA8` with `02` + follower address (reply `00 02 00`).
+
+A twinned host does not show up in scans, but the watch has reconnected to one by address
+after about 50 s of retries (captured once), so a lost link is not always final.
 
 Twinned, the host's fitness mode changes shape (captured from the watch):
 

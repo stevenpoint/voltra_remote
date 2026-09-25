@@ -309,11 +309,13 @@ struct TwinStatus {
     uint8_t own[6] = {0};    // this unit's address, in printed order
     uint8_t peer[6] = {0};   // the other unit's, all zero when alone
     bool has_addrs = false;  // own/peer present (short replies carry only the state)
+    int peer_battery = -1;   // the other unit's battery %, -1 when not reported
 };
 
 /**
- * Decode `39 01 SS <own addr> <peer addr> ...`, optionally after a leading status byte.
- * Returns false for any other packet.
+ * Decode `BB 01 SS <own addr> <peer addr> PB ...` (BB = this unit's battery %, PB = the
+ * other unit's, 0 when alone), optionally after a leading 00 status byte. Returns false
+ * for any other packet.
  */
 bool parse_twin_status(const Packet &pkt, TwinStatus &out);
 

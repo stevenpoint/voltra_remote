@@ -74,6 +74,7 @@ struct DeviceState {
     /** Twin mode (docs/PROTOCOL.md, "Twin mode"): TWIN_STATE_*, -1 unknown. */
     int twin_state = -1;
     char twin_peer[20] = {0};   // the other unit's address while twinned
+    int twin_peer_battery = -1; // the other unit's battery %, -1 unknown
 
     bool twinned() const { return twin_state == TWIN_STATE_TWINNED; }
     bool connected() const { return conn == ConnState::Handshaking || conn == ConnState::Ready; }

@@ -234,6 +234,7 @@ void Client::untwin()
 
 void Client::queueTwinStatusRead()
 {
+    log_d("twin: status request");
     uint8_t buf[32];
     enqueue(buf, build_frame(buf, sizeof(buf), CMD_TWIN_STATUS, nullptr, 0, nextSeq()));
 }
@@ -662,6 +663,15 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
         }
         log_i("rx %02x [%u] %s", pkt.cmd, (unsigned)pkt.payload_len, hex);
     }
+    if (s_log_params && pkt.cmd != CMD_PARAM_READ && pkt.cmd != CMD_ASYNC_STATE && pkt.cmd != CMD_TELEMETRY) {
+        // Everything else (twin status, bootstrap replies...), in full.
+        char hex[2 * 48 + 1];
+        int o = 0;
+        for (size_t i = 0; i < pkt.payload_len && i < 48; i++) {
+            o += snprintf(hex + o, sizeof(hex) - o, "%02x", pkt.payload[i]);
+        }
+        log_i("rx %02x [%u] %s", pkt.cmd, (unsigned)pkt.payload_len, hex);
+    }
     if (s_log_params && pkt.cmd == CMD_TELEMETRY) {
         // Workout telemetry streams quickly; log a frame only when its first bytes change.
         static uint8_t last[12];
@@ -849,6 +859,10 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
                 strcpy(state_.twin_peer, peer);
                 changed = true;
             }
+            if (state_.twin_peer_battery != twin.peer_battery) {
+                state_.twin_peer_battery = twin.peer_battery;
+                changed = true;
+            }
         }
     }
 
@@ -998,6 +1012,7 @@ void Client::teardown()
     state_.protocol_ok = false;
     state_.twin_state = -1;
     state_.twin_peer[0] = 0;
+    state_.twin_peer_battery = -1;
     state_.reps = 0;
     state_.sets = 0;
     state_.force_known = false;
