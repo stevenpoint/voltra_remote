@@ -18,8 +18,15 @@ constexpr int STEP_FINE_LB = 1;
 constexpr int STEP_COARSE_LB = 5;
 
 /** Per-detent interval thresholds, with a dead band so the mode cannot flap mid-turn. */
+#ifdef WATCH206
+// Watch: a detent is 24 px of finger travel (hw/knob.cpp), and an ordinary drag easily
+// beats the knob's 70 ms. Coarse needs a quick swipe, about 1000 px/s.
+constexpr uint32_t COARSE_ENTER_MS = 25;   // faster than this -> coarse
+constexpr uint32_t COARSE_EXIT_MS = 50;    // slower than this -> fine
+#else
 constexpr uint32_t COARSE_ENTER_MS = 70;   // faster than this -> coarse
 constexpr uint32_t COARSE_EXIT_MS = 140;   // slower than this -> fine
+#endif
 constexpr uint32_t IDLE_RESET_MS = 400;    // a pause this long resets to fine
 
 /** Division rounding towards negative / positive infinity (C truncates towards zero). */

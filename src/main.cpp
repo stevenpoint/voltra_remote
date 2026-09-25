@@ -4,6 +4,7 @@
  */
 #include <Arduino.h>
 
+#include "diag/flash_log.h"
 #include "hw/battery.h"
 #include "hw/display.h"
 #include "hw/haptics.h"
@@ -17,6 +18,7 @@ void setup()
 {
     Serial.begin(115200);
     delay(100);
+    flash_log_begin();   // diagnostic builds only
     log_i("Voltra Remote starting (free heap %u)", (unsigned)ESP.getFreeHeap());
 
     i2c_bus_init();

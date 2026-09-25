@@ -67,6 +67,22 @@ constexpr uint8_t VENDOR_DIRECT_LOAD    = 0x12;   // start the Voltra's auto loa
 constexpr uint8_t VENDOR_STATE_REFRESH  = 0x13;   // + 0x01: refresh the vendor state stream
 constexpr uint8_t CMD_ACTIVATION      = 0xAB;
 
+// Twin mode, captured from Beyond+ (docs/PROTOCOL.md, "Twin mode").
+constexpr uint8_t CMD_TWIN_STATUS     = 0xA7;   // empty request; see parse_twin_status()
+constexpr uint8_t CMD_TWIN_LINK       = 0xA8;   // TWIN_LINK_* + the other unit's address
+constexpr uint8_t TWIN_LINK_JOIN      = 0x01;   // to the follower: join this host
+constexpr uint8_t TWIN_LINK_LEAVE     = 0x02;   // to the host: drop this follower
+constexpr int TWIN_STATE_ALONE        = 0x00;
+constexpr int TWIN_STATE_JOINING      = 0x11;
+constexpr int TWIN_STATE_TWINNED      = 0x12;
+// While hosting a twin the host's fitness mode carries a flag in the high byte:
+// 0x0100 idle (also what a refused load settles at), 0x0101 loaded. Load and unload are
+// written the same way. Its auto load reads 0x2003 rather than 0x23 and finishes at
+// DIRECT_LOAD_ST 15 rather than 14 (captured, docs/PROTOCOL.md).
+constexpr uint16_t FITNESS_MODE_TWIN_LOAD      = 0x0101;
+constexpr uint16_t FITNESS_MODE_TWIN_UNLOAD    = 0x0100;
+constexpr uint16_t FITNESS_MODE_TWIN_AUTO_LOAD = 0x2003;
+
 // ---------------------------------------------------------------------------
 // Parameters (subset we use; the registry in the .cpp knows the sizes of more)
 // ---------------------------------------------------------------------------
@@ -160,12 +176,14 @@ constexpr int DIRECT_LOAD_ST_WAITING   = 11;   // waiting for the cable to be pu
 constexpr int DIRECT_LOAD_ST_COUNTDOWN = 12;   // held: counting down (restarts if it moves)
 constexpr int DIRECT_LOAD_ST_ENGAGING  = 13;   // countdown done, weight coming on
 constexpr int DIRECT_LOAD_ST_LOADED    = 14;   // loaded
+constexpr int DIRECT_LOAD_ST_TWIN_LOADED = 15; // loaded, twinned
 
 constexpr bool fitness_mode_is_auto_load(int mode)
 {
     return mode >= 0 && ((mode & 0xFF) == FITNESS_MODE_AUTO_LOAD ||
                          (mode & 0xFF) == FITNESS_MODE_DIRECT_LOAD_READY ||
-                         (mode & 0xFF) == FITNESS_MODE_DIRECT_LOAD_ACTIVE);
+                         (mode & 0xFF) == FITNESS_MODE_DIRECT_LOAD_ACTIVE ||
+                         mode == FITNESS_MODE_TWIN_AUTO_LOAD);
 }
 
 /** Weight on: a set active, idle/resting, or an auto load that has finished its countdown. */
@@ -284,6 +302,20 @@ int parse_workout_status(const Packet &pkt);
 
 /** @return 1 activated, 0 not activated, -1 not an activation packet */
 int parse_activation(const Packet &pkt);
+
+/** A unit's twin status (CMD_TWIN_STATUS reply or push). */
+struct TwinStatus {
+    int state = -1;          // TWIN_STATE_*
+    uint8_t own[6] = {0};    // this unit's address, in printed order
+    uint8_t peer[6] = {0};   // the other unit's, all zero when alone
+    bool has_addrs = false;  // own/peer present (short replies carry only the state)
+};
+
+/**
+ * Decode `39 01 SS <own addr> <peer addr> ...`, optionally after a leading status byte.
+ * Returns false for any other packet.
+ */
+bool parse_twin_status(const Packet &pkt, TwinStatus &out);
 
 /** Reassembles frames that arrive split across (or packed into) BLE notifications. */
 class FrameAssembler {

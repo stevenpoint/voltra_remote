@@ -322,6 +322,27 @@ bool parse_rep_telemetry(const Packet &pkt, RepTelemetry &out)
     return true;
 }
 
+bool parse_twin_status(const Packet &pkt, TwinStatus &out)
+{
+    if (pkt.cmd != CMD_TWIN_STATUS) return false;
+    const uint8_t *p = pkt.payload;
+    const size_t n = pkt.payload_len;
+    // Replies come both with and without a leading 00 status byte.
+    for (size_t k = 0; k <= 1; k++) {
+        if (n >= k + 3 && p[k] == 0x39 && p[k + 1] == 0x01) {
+            out = TwinStatus();
+            out.state = p[k + 2];
+            if (n >= k + 15) {
+                memcpy(out.own, p + k + 3, 6);
+                memcpy(out.peer, p + k + 9, 6);
+                out.has_addrs = true;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 int parse_activation(const Packet &pkt)
 {
     if (pkt.cmd != CMD_ACTIVATION || pkt.payload_len < 2 || pkt.payload[0] != 0) return -1;

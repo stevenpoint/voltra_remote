@@ -320,6 +320,57 @@ void test_coarse_steps_snap_correctly_below_zero()
     TEST_ASSERT_EQUAL_INT(-5, apply_step(0, -1, STEP_COARSE_LB));
 }
 
+// Twin status replies captured from Beyond+ (docs/PROTOCOL.md, "Twin mode").
+static bool twin_from_payload(const char *payload_hex, TwinStatus &ts)
+{
+    uint8_t payload[64];
+    const size_t n = hex2bin(payload_hex, payload, sizeof(payload));
+    uint8_t frame[96];
+    const size_t len = build_frame(frame, sizeof(frame), CMD_TWIN_STATUS, payload, n, 1, 0x10, 0xAA);
+    Packet pkt;
+    TEST_ASSERT_TRUE(parse_packet(frame, len, pkt));
+    return parse_twin_status(pkt, ts);
+}
+
+void test_twin_status_alone()
+{
+    TwinStatus ts;
+    TEST_ASSERT_TRUE(twin_from_payload("39010080b54e0702a600000000000000010000001600", ts));
+    TEST_ASSERT_EQUAL_INT(TWIN_STATE_ALONE, ts.state);
+    TEST_ASSERT_TRUE(ts.has_addrs);
+    TEST_ASSERT_EQUAL_HEX8(0xa6, ts.own[5]);
+    TEST_ASSERT_EQUAL_HEX8(0x00, ts.peer[0]);
+}
+
+void test_twin_status_twinned()
+{
+    TwinStatus ts;
+    // with the leading status byte
+    TEST_ASSERT_TRUE(twin_from_payload("0039011280b54e0702a680b54e0742a239010000001618", ts));
+    TEST_ASSERT_EQUAL_INT(TWIN_STATE_TWINNED, ts.state);
+    const uint8_t peer[6] = {0x80, 0xb5, 0x4e, 0x07, 0x42, 0xa2};
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(peer, ts.peer, 6);
+}
+
+void test_twin_status_short()
+{
+    TwinStatus ts;
+    TEST_ASSERT_TRUE(twin_from_payload("39010080b54e07", ts));
+    TEST_ASSERT_EQUAL_INT(TWIN_STATE_ALONE, ts.state);
+    TEST_ASSERT_FALSE(ts.has_addrs);
+}
+
+// Twinned fitness-mode values (captured).
+void test_twin_modes()
+{
+    TEST_ASSERT_TRUE(voltra_loaded(FITNESS_MODE_TWIN_LOAD, -1));
+    TEST_ASSERT_FALSE(voltra_loaded(FITNESS_MODE_TWIN_UNLOAD, -1));
+    TEST_ASSERT_TRUE(voltra_auto_loading(FITNESS_MODE_TWIN_AUTO_LOAD, DIRECT_LOAD_ST_WAITING));
+    TEST_ASSERT_TRUE(voltra_auto_loading(FITNESS_MODE_TWIN_AUTO_LOAD, DIRECT_LOAD_ST_COUNTDOWN));
+    TEST_ASSERT_TRUE(voltra_loaded(FITNESS_MODE_TWIN_AUTO_LOAD, DIRECT_LOAD_ST_TWIN_LOADED));
+    TEST_ASSERT_FALSE(voltra_auto_loading(FITNESS_MODE_TWIN_AUTO_LOAD, DIRECT_LOAD_ST_TWIN_LOADED));
+}
+
 void test_slow_turn_stays_fine()
 {
     knobstep::RateTracker r;
@@ -425,6 +476,10 @@ int main(int, char **)
     RUN_TEST(test_fine_steps_are_one_pound);
     RUN_TEST(test_coarse_steps_snap_to_multiples_of_five);
     RUN_TEST(test_coarse_steps_snap_correctly_below_zero);
+    RUN_TEST(test_twin_status_alone);
+    RUN_TEST(test_twin_status_twinned);
+    RUN_TEST(test_twin_status_short);
+    RUN_TEST(test_twin_modes);
     RUN_TEST(test_slow_turn_stays_fine);
     RUN_TEST(test_fast_turn_becomes_coarse);
     RUN_TEST(test_several_detents_in_one_poll_are_coarse);

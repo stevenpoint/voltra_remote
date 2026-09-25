@@ -64,12 +64,18 @@ struct DeviceState {
     int force_lb = 0;
     bool force_known = false;
     int position_cm = 0;
+    /** Bumped each time a load gives up without the weight going on (e.g. cable pulled out). */
+    uint32_t load_refused = 0;
     uint16_t reps = 0;
     uint8_t sets = 0;
     uint8_t rep_phase = 0;
     int workout_status = -1;   // WORKOUT_STATUS_*, -1 not seen yet
     uint32_t last_rx_ms = 0;
+    /** Twin mode (docs/PROTOCOL.md, "Twin mode"): TWIN_STATE_*, -1 unknown. */
+    int twin_state = -1;
+    char twin_peer[20] = {0};   // the other unit's address while twinned
 
+    bool twinned() const { return twin_state == TWIN_STATE_TWINNED; }
     bool connected() const { return conn == ConnState::Handshaking || conn == ConnState::Ready; }
     /** The Voltra's auto load is running: waiting for the cable pull, or counting down. */
     bool auto_loading() const { return voltra_auto_loading(fitness_mode, direct_load_status); }
@@ -108,7 +114,24 @@ public:
     void unload();
     /** Start the Voltra's auto load: it loads once the cable is pulled out and held. */
     void autoLoad();
+    /**
+     * Load with the cable pulled out, which a plain load() cannot (the Voltra refuses it).
+     * Starts auto load, then writes 2 ("bypass") to DIRECT_LOAD_SAFETY_CHECK_CTRL while it
+     * waits, so it loads at once without the pull-and-hold countdown. The watch sends this
+     * only when the user taps "override" after a refused load. See docs/PROTOCOL.md,
+     * "Loading with the cable out".
+     */
+    void loadOverride();
     void refresh();
+    /**
+     * Twin the connected Voltra (the host) with `follower`, the way Beyond+ does: open a
+     * short second connection to the follower and tell it to join this host. The watch
+     * keeps its connection to the host, which stops advertising while it hosts, so the
+     * pair can only be driven through a connection made before twinning.
+     */
+    void twinWith(const FoundDevice &follower);
+    /** Un-twin: tell the host to drop its follower. */
+    void untwin();
 
     // --- state --------------------------------------------------------------
     DeviceState state() const;
@@ -123,6 +146,8 @@ public:
     void onScanEnd();
     void onDisconnected(int reason);
     void onNotify(uint8_t slot, const uint8_t *data, size_t len);
+    void onAuxNotify(uint8_t slot, const uint8_t *data, size_t len);
+    void onAuxDisconnected() { aux_disconnected_ = true; }
     void task();
 
 private:
@@ -137,6 +162,10 @@ private:
         bool load = false;
         bool unload = false;
         bool auto_load = false;
+        bool load_override = false;
+        bool twin = false;
+        bool untwin = false;
+        FoundDevice twin_target;
         bool has_weight = false;
         bool has_chains = false;
         bool has_eccentric = false;
@@ -157,6 +186,12 @@ private:
         uint8_t len;
     };
 
+    void noteLoadRefused();
+    bool isTwinned() const;
+    /** Fitness mode to write for a load or unload: the twin values while twinned. */
+    uint16_t loadModeValue(bool load) const;
+    bool joinFollower(const FoundDevice &follower, const std::string &host_addr);
+    void queueTwinStatusRead();
     void lockState() const;
     void unlockState() const;
     void bump() { version_++; }
@@ -217,6 +252,7 @@ private:
     /** While set, poll the auto-load countdown quickly so the screen can count along. */
     uint32_t auto_load_watch_until_ = 0;
     uint32_t auto_load_started_ms_ = 0;
+    bool bypass_on_wait_ = false;   // override: write the bypass once auto load waits
     uint32_t last_auto_load_poll_ms_ = 0;
     void queueDirectLoadRead();
 
@@ -224,6 +260,16 @@ private:
     bool sweep_active_ = false;
     size_t sweep_pos_ = 0;
     uint32_t sweep_next_ms_ = 0;
+
+    // twin: the short second connection to the follower (joinFollower)
+    FrameAssembler aux_assemblers_[3];
+    std::atomic<int> aux_link_reply_{-1};   // CMD_TWIN_LINK reply's first byte, -1 none yet
+    std::atomic<bool> aux_disconnected_{false};
+    // Twinned, the host echoes FITNESS_MODE_TWIN_LOAD at once when it accepts a load;
+    // a refused one never does (the idle state reads the same as a refusal).
+    std::atomic<bool> twin_load_ack_{false};
+    uint32_t last_twin_poll_ms_ = 0;
+    uint32_t last_refresh_ms_ = 0;
 
     // worker-task-private
     void *client_ = nullptr;        // NimBLEClient*

@@ -60,6 +60,7 @@ constexpr uint32_t EDIT_HOLD_MS = 900;
 // through its intermediate state, so the screen says "LOADING..." rather than
 // flicking back to unloaded mid-sequence.
 constexpr uint32_t TOGGLE_PENDING_MS = 5000;
+constexpr uint32_t LOAD_REFUSED_SHOW_MS = 10000;   // how long a tap means "override"
 constexpr uint32_t AUTO_LOAD_PENDING_MS = 4000;
 
 enum class Screen { Main, Settings, AdjustChains, AdjustEcc, Connect };
@@ -118,6 +119,8 @@ struct Ui {
     };
     Preset presets[2];
     lv_obj_t *lbl_kbat = nullptr;
+    // Covers the whole main screen while loaded, so a tap anywhere unloads.
+    lv_obj_t *unload_catcher = nullptr;
 
     // settings menu: one bubble per accessory
     lv_obj_t *scr_settings = nullptr;
@@ -167,6 +170,10 @@ struct Ui {
     bool toggle_target_loaded = false;
     // Auto load was just requested: show it until the Voltra reports its own progress.
     uint32_t auto_load_pending_until = 0;
+    // The Voltra refused a tap-to-load (cable out). Until then, a tap sends the
+    // override (Client::loadOverride()) instead of a plain load.
+    uint32_t load_refused_until = 0;
+    uint32_t last_load_refused = 0;
     // A set is under way: loaded and the cable has moved since the last rest.
     bool set_active = false;
 
@@ -300,6 +307,131 @@ lv_obj_t *make_ring(lv_obj_t *parent, lv_color_t color)
     lv_obj_set_style_arc_rounded(arc, true, LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
     return arc;
+}
+
+#ifdef WATCH206
+// ---------------------------------------------------------------------------
+// Edge scale (watch): in place of the round ring, tick marks follow the screen's
+// rounded edge from the bottom of the left side, over the top, to the bottom of the
+// right side. One tick per lb, longer every 5 and 25 lb. Ticks up to the weight are
+// lit, and a long white tick marks the weight itself.
+// ---------------------------------------------------------------------------
+constexpr float EDGE_INSET = 6;     // gap between the screen edge and the ticks' outer ends
+constexpr float EDGE_RADIUS = 96;   // corner radius of that path, to follow the panel's corners
+#define C_TICK_OFF lv_color_hex(0x374151)
+
+struct EdgeScale {
+    int lo = voltra::MIN_TARGET_LB;
+    int hi = voltra::MAX_TARGET_LB;
+    int value = voltra::MIN_TARGET_LB;
+    lv_color_t color = C_IDLE_RING;
+} s_edge;
+
+struct EdgePt {
+    float x, y;     // on the path
+    float nx, ny;   // unit normal pointing into the screen
+};
+
+/** Straight left side, top-left corner, top, top-right corner, straight right side. */
+float edge_segments(float w, float h, float &side, float &quarter, float &top)
+{
+    const float r = EDGE_RADIUS;
+    side = (h - 2 * EDGE_INSET) - 2 * r;
+    quarter = (float)M_PI * r / 2;
+    top = (w - 2 * EDGE_INSET) - 2 * r;
+    return 2 * side + 2 * quarter + top;
+}
+
+/** Point at distance s along the path, starting at the bottom of the left side. */
+EdgePt edge_point(float s, float w, float h)
+{
+    const float r = EDGE_RADIUS;
+    const float x0 = EDGE_INSET, y0 = EDGE_INSET, x1 = w - 1 - EDGE_INSET, y1 = h - 1 - EDGE_INSET;
+    float side, quarter, top;
+    edge_segments(w, h, side, quarter, top);
+    if (s < side) return {x0, y1 - r - s, 1, 0};
+    s -= side;
+    if (s < quarter) {
+        const float a = (float)M_PI + s / r;
+        const float c = cosf(a), d = sinf(a);
+        return {x0 + r + r * c, y0 + r + r * d, -c, -d};
+    }
+    s -= quarter;
+    if (s < top) return {x0 + r + s, y0, 0, 1};
+    s -= top;
+    if (s < quarter) {
+        const float a = 1.5f * (float)M_PI + s / r;
+        const float c = cosf(a), d = sinf(a);
+        return {x1 - r + r * c, y0 + r + r * d, -c, -d};
+    }
+    s -= quarter;
+    return {x1, y0 + r + s, -1, 0};
+}
+
+void edge_tick(lv_draw_ctx_t *ctx, lv_draw_line_dsc_t &dsc, const lv_area_t &a, float s,
+               float w, float h, float len)
+{
+    const EdgePt p = edge_point(s, w, h);
+    lv_point_t p1 = {(lv_coord_t)(a.x1 + lroundf(p.x)), (lv_coord_t)(a.y1 + lroundf(p.y))};
+    lv_point_t p2 = {(lv_coord_t)(a.x1 + lroundf(p.x + p.nx * len)),
+                     (lv_coord_t)(a.y1 + lroundf(p.y + p.ny * len))};
+    lv_draw_line(ctx, &dsc, &p1, &p2);
+}
+
+void edge_scale_draw(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_draw_ctx_t *ctx = lv_event_get_draw_ctx(e);
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const float w = lv_area_get_width(&a), h = lv_area_get_height(&a);
+    float side, quarter, top;
+    const float total = edge_segments(w, h, side, quarter, top);
+    const int span = s_edge.hi > s_edge.lo ? s_edge.hi - s_edge.lo : 1;
+
+    lv_draw_line_dsc_t dsc;
+    lv_draw_line_dsc_init(&dsc);
+    // Twinned the range doubles; a tick per 2 lb keeps the same spacing.
+    const int unit = span > 250 ? 2 : 1;
+    for (int v = s_edge.lo; v <= s_edge.hi; v += unit) {
+        const bool major = v % (25 * unit) == 0, mid = v % (5 * unit) == 0;
+        dsc.width = major ? 3 : 2;
+        dsc.color = v <= s_edge.value ? s_edge.color : C_TICK_OFF;
+        edge_tick(ctx, dsc, a, total * (v - s_edge.lo) / span, w, h, major ? 20 : mid ? 13 : 8);
+    }
+    dsc.width = 4;
+    dsc.round_start = dsc.round_end = 1;
+    dsc.color = C_TEXT;
+    edge_tick(ctx, dsc, a, total * (s_edge.value - s_edge.lo) / span, w, h, 28);
+}
+
+lv_obj_t *make_edge_scale(lv_obj_t *parent)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, LV_PCT(100), LV_PCT(100));
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(o, edge_scale_draw, LV_EVENT_DRAW_MAIN, nullptr);
+    return o;
+}
+#endif
+
+/** Weight gauge: the edge scale on the watch, the ring on the knob. */
+void set_weight_gauge(lv_obj_t *gauge, int lo, int hi, int value, lv_color_t color)
+{
+#ifdef WATCH206
+    value = value < lo ? lo : (value > hi ? hi : value);
+    if (s_edge.lo == lo && s_edge.hi == hi && s_edge.value == value &&
+        lv_color_to32(s_edge.color) == lv_color_to32(color)) {
+        return;
+    }
+    s_edge = {lo, hi, value, color};
+    lv_obj_invalidate(gauge);
+#else
+    lv_arc_set_range(gauge, lo, hi);
+    lv_arc_set_value(gauge, value);
+    lv_obj_set_style_arc_color(gauge, color, LV_PART_INDICATOR);
+#endif
 }
 
 lv_obj_t *make_flat_button(lv_obj_t *parent, int w, int h)
@@ -490,7 +622,7 @@ void refresh_main();
 constexpr const char *PRESET_NS = "knob";
 const char *const PRESET_KEYS[2] = {"preset0", "preset1"};
 
-void load_presets()
+[[maybe_unused]] void load_presets()
 {
     Preferences p;
     if (!p.begin(PRESET_NS, true)) return;   // namespace not created yet: all empty
@@ -510,6 +642,7 @@ void save_preset(int i)
 void refresh_presets()
 {
     for (auto &pr : ui.presets) {
+        if (!pr.btn) continue;   // not built (watch)
         if (pr.lb > 0) {
             lv_label_set_text_fmt(pr.value, "%d", pr.lb);
             lv_obj_set_style_text_color(pr.value, C_TEXT, 0);
@@ -550,7 +683,7 @@ void on_preset_hold(lv_event_t *e)
     refresh_presets();
 }
 
-void make_preset(int i, int x, int y)
+[[maybe_unused]] void make_preset(int i, int x, int y)
 {
     auto &pr = ui.presets[i];
     pr.btn = make_pill_button(ui.scr_main, 56, 56, C_TRACK, "", nullptr);
@@ -574,20 +707,17 @@ void refresh_main()
     bool ready = st.conn == ConnState::Ready;
     uint32_t now = millis();
 
-    // ring + weight
-    lv_arc_set_range(ui.arc_weight, voltra::MIN_TARGET_LB, weight_max());
-    lv_arc_set_value(ui.arc_weight, ui.weight);
-    if (connected) {
-        lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight);
-    } else {
-        lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight);
-    }
+    // weight
+    // The Voltra's weight is per unit; twinned, show the pair's total like its screen does.
+    const int per_unit_x = st.twinned() ? 2 : 1;
+    lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight * per_unit_x);
 
     bool loaded = st.loaded();
     bool pending = now < ui.toggle_pending_until && loaded != ui.toggle_target_loaded;
     lv_color_t ring = loaded ? C_LOADED : C_IDLE_RING;
     if (!connected) ring = C_TRACK;
-    lv_obj_set_style_arc_color(ui.arc_weight, ring, LV_PART_INDICATOR);
+    set_weight_gauge(ui.arc_weight, voltra::MIN_TARGET_LB * per_unit_x, weight_max() * per_unit_x,
+                     ui.weight * per_unit_x, ring);
 
     const bool auto_loading = connected && (st.auto_loading() || now < ui.auto_load_pending_until);
     if (!connected) {
@@ -600,6 +730,12 @@ void refresh_main()
         const int ms = st.direct_load_countdown_ms;
         if (ms > 0 && ms <= 3000) lv_label_set_text_fmt(ui.lbl_state, "LOADING IN %d", (ms + 999) / 1000);
         else lv_label_set_text(ui.lbl_state, "PULL & HOLD CABLE");
+        lv_obj_set_style_text_color(ui.lbl_state, C_WARN, 0);
+        lv_obj_set_style_text_color(ui.lbl_weight, C_IDLE_NUM, 0);
+    } else if (!loaded && now < ui.load_refused_until) {
+        // Tap-to-load refused because the cable is out. A tap now overrides and loads
+        // at once; hold still starts the Voltra's auto load.
+        lv_label_set_text(ui.lbl_state, "CABLE OUT: TAP TO OVERRIDE");
         lv_obj_set_style_text_color(ui.lbl_state, C_WARN, 0);
         lv_obj_set_style_text_color(ui.lbl_weight, C_IDLE_NUM, 0);
     } else if (pending) {
@@ -636,6 +772,11 @@ void refresh_main()
         snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#   %s %d%%", bt_hex, sym, st.battery);
     } else {
         snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#", bt_hex);
+    }
+    if (connected && (st.twinned() || st.twin_state == voltra::TWIN_STATE_JOINING)) {
+        // Twin mode: this Voltra hosts, and every command drives the pair.
+        const size_t n = strlen(top);
+        snprintf(top + n, sizeof(top) - n, st.twinned() ? "   #%s TWIN#" : "   #%s TWINNING#", C_WHITE_HEX);
     }
     lv_label_set_text(ui.lbl_top, top);
     lv_obj_set_style_text_color(ui.lbl_top, C_TEXT, 0);
@@ -704,12 +845,14 @@ void refresh_main()
         lv_obj_add_flag(ui.btn_gear, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ui.chip_ecc.btn, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ui.chip_chain.btn, LV_OBJ_FLAG_HIDDEN);
-        for (auto &pr : ui.presets) lv_obj_add_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
+        for (auto &pr : ui.presets) if (pr.btn) lv_obj_add_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(ui.btn_gear, LV_OBJ_FLAG_HIDDEN);
-        for (auto &pr : ui.presets) lv_obj_clear_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
+        for (auto &pr : ui.presets) if (pr.btn) lv_obj_clear_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
         // the chips were shown or hidden above according to the accessories
     }
+
+    set_obj_hidden(ui.unload_catcher, !(ready && loaded));
 }
 
 void on_center_clicked(lv_event_t *)
@@ -725,8 +868,20 @@ void on_center_clicked(lv_event_t *)
         haptics_buzz();
         return;
     }
+    // A tap straight after a refused load (cable out) is the override.
+    const bool override = !ui.st.loaded() && millis() < ui.load_refused_until;
+    ui.load_refused_until = 0;
     // Push any pending dial edits first so the device loads the weight on screen.
     flush_pending(millis() + SEND_DEBOUNCE_MS);
+    if (override) {
+        // Runs through the Voltra's auto load, so show it as one.
+        c.loadOverride();
+        ui.toggle_pending_until = 0;
+        ui.auto_load_pending_until = millis() + AUTO_LOAD_PENDING_MS;
+        haptics_double();
+        refresh_main();
+        return;
+    }
     if (!ui.st.loaded() && (ui.st.auto_loading() || millis() < ui.auto_load_pending_until)) {
         // Tapping during auto load cancels it.
         ui.auto_load_pending_until = 0;
@@ -752,6 +907,7 @@ void on_center_hold(lv_event_t *)
     }
     flush_pending(millis() + SEND_DEBOUNCE_MS);
     ui.toggle_pending_until = 0;
+    ui.load_refused_until = 0;
     ui.auto_load_pending_until = millis() + AUTO_LOAD_PENDING_MS;
     VClient::instance().autoLoad();
     haptics_double();
@@ -786,26 +942,61 @@ void on_chip_clicked(lv_event_t *e)
 /** A small round button: an active accessory's icon over its amount in both units. */
 void make_chip(Ui::Chip &c, const char *icon, lv_color_t colour, int x, int y)
 {
-    c.btn = make_pill_button(ui.scr_main, 70, 70, colour, "", nullptr);
+#ifdef WATCH206
+    // 1.3x the knob's chips
+    constexpr int size = 91, row = 22;
+    const lv_font_t *icon_font = &font_icons_26, *text_font = &font_poppins_18;
+#else
+    constexpr int size = 70, row = 17;
+    const lv_font_t *icon_font = &font_icons_18, *text_font = &font_poppins_14;
+#endif
+    c.btn = make_pill_button(ui.scr_main, size, size, colour, "", nullptr);
     lv_obj_align(c.btn, LV_ALIGN_CENTER, x, y);
     lv_obj_add_event_cb(c.btn, on_chip_clicked, LV_EVENT_CLICKED, nullptr);
-    c.icon = make_label(c.btn, &font_icons_18, colour, icon);
-    lv_obj_align(c.icon, LV_ALIGN_CENTER, 0, -17);
-    c.primary = make_label(c.btn, &font_poppins_14, C_TEXT, "");
+    c.icon = make_label(c.btn, icon_font, colour, icon);
+    lv_obj_align(c.icon, LV_ALIGN_CENTER, 0, -row);
+    c.primary = make_label(c.btn, text_font, C_TEXT, "");
     lv_obj_align(c.primary, LV_ALIGN_CENTER, 0, 1);
-    c.secondary = make_label(c.btn, &font_poppins_14, C_MUTED, "");
-    lv_obj_align(c.secondary, LV_ALIGN_CENTER, 0, 17);
+    c.secondary = make_label(c.btn, text_font, C_MUTED, "");
+    lv_obj_align(c.secondary, LV_ALIGN_CENTER, 0, row);
     lv_obj_add_flag(c.btn, LV_OBJ_FLAG_HIDDEN);
 }
+
+// Main screen layout, as offsets from the screen centre.
+#ifdef WATCH206
+// 410x502: the weight about 1.7x the knob's (2x would not fit "200" between the edge
+// ticks), and the settings row down by the battery line.
+#define L_WEIGHT_FONT font_poppins_160
+#define L_STATE_FONT font_poppins_16
+constexpr const char *L_WEIGHT_UNIT = "lbs";
+constexpr int L_CENTER_W = 360, L_CENTER_H = 230, L_CENTER_Y = -40;
+constexpr int L_REPS_Y = 52;
+constexpr int L_GEAR_Y = 182;
+constexpr int L_CHIP_X = 100, L_CHIP_Y = 172;
+#else
+#define L_WEIGHT_FONT font_poppins_96
+#define L_STATE_FONT font_poppins_14
+constexpr const char *L_WEIGHT_UNIT = "lb";
+constexpr int L_CENTER_W = 236, L_CENTER_H = 150, L_CENTER_Y = -34;
+constexpr int L_REPS_Y = 50;
+constexpr int L_GEAR_Y = 114;
+constexpr int L_CHIP_X = 74, L_CHIP_Y = 96;
+#endif
 
 void build_main()
 {
     ui.scr_main = make_screen();
+#ifdef WATCH206
+    ui.arc_weight = make_edge_scale(ui.scr_main);
+    constexpr int TOP_BAR_Y = 34;   // below the edge scale's ticks
+#else
     ui.arc_weight = make_ring(ui.scr_main, C_IDLE_RING);
+    constexpr int TOP_BAR_Y = 20;
+#endif
 
     // top bar (tap -> connect menu)
     ui.btn_top = make_flat_button(ui.scr_main, 220, 44);
-    lv_obj_align(ui.btn_top, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_align(ui.btn_top, LV_ALIGN_TOP_MID, 0, TOP_BAR_Y);
     lv_obj_add_event_cb(ui.btn_top, on_top_clicked, LV_EVENT_CLICKED, nullptr);
     ui.lbl_top = make_label(ui.btn_top, &font_poppins_16, C_TEXT, "");
     lv_label_set_recolor(ui.lbl_top, true);
@@ -814,7 +1005,7 @@ void build_main()
 
     // sets / reps sit under the weight
     ui.lbl_reps = make_label(ui.scr_main, &font_poppins_14, C_MUTED, "");
-    lv_obj_align(ui.lbl_reps, LV_ALIGN_CENTER, 0, 50);
+    lv_obj_align(ui.lbl_reps, LV_ALIGN_CENTER, 0, L_REPS_Y);
 
     // During a set: two big counters filling the space the bubbles use at rest.
     ui.lbl_set_cap = make_label(ui.scr_main, &font_poppins_22, C_MUTED, "Set");
@@ -856,37 +1047,50 @@ void build_main()
 
     // centre: weight, tap to load/unload
     // The weight's touch target also covers the tap-to-load line at its top.
-    ui.btn_center = make_flat_button(ui.scr_main, 236, 150);
-    lv_obj_align(ui.btn_center, LV_ALIGN_CENTER, 0, -34);
+    ui.btn_center = make_flat_button(ui.scr_main, L_CENTER_W, L_CENTER_H);
+    lv_obj_align(ui.btn_center, LV_ALIGN_CENTER, 0, L_CENTER_Y);
     // Short-clicked, not clicked, so releasing a hold (auto load) is not also a tap.
     lv_obj_add_event_cb(ui.btn_center, on_center_clicked, LV_EVENT_SHORT_CLICKED, nullptr);
     lv_obj_add_event_cb(ui.btn_center, on_center_hold, LV_EVENT_LONG_PRESSED, nullptr);
-    lv_obj_t *row = make_value_row(ui.btn_center, &font_poppins_96, &ui.lbl_weight, &ui.lbl_unit);
+    lv_obj_t *row = make_value_row(ui.btn_center, &L_WEIGHT_FONT, &ui.lbl_weight, &ui.lbl_unit);
+    lv_label_set_text(ui.lbl_unit, L_WEIGHT_UNIT);
     lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);   // 8 px higher on screen than before
-    ui.lbl_state = make_label(ui.btn_center, &font_poppins_14, C_MUTED, "NOT CONNECTED");
+    ui.lbl_state = make_label(ui.btn_center, &L_STATE_FONT, C_MUTED, "NOT CONNECTED");
     lv_obj_align(ui.lbl_state, LV_ALIGN_TOP_MID, 0, 4);
 
     ui.btn_gear = make_pill_button(ui.scr_main, 64, 64, C_TRACK, "", nullptr);
-    lv_obj_align(ui.btn_gear, LV_ALIGN_CENTER, 0, 114);
+    lv_obj_align(ui.btn_gear, LV_ALIGN_CENTER, 0, L_GEAR_Y);
     lv_obj_add_event_cb(ui.btn_gear, on_gear_clicked, LV_EVENT_CLICKED, nullptr);
     ui.lbl_gear = make_label(ui.btn_gear, &font_icons_26, C_TEXT, ICON_SETTINGS);
     lv_obj_center(ui.lbl_gear);
 
     // Chips for the active accessories, shown only while on. Kept inside the ring: the
     // outer edge is ~156 px from centre against the ring's 158 px.
-    make_chip(ui.chip_ecc, ICON_ECCENTRIC, C_ECC, -74, 96);
-    make_chip(ui.chip_chain, ICON_CHAINS, C_CHAINS, 74, 96);
+    make_chip(ui.chip_ecc, ICON_ECCENTRIC, C_ECC, -L_CHIP_X, L_CHIP_Y);
+    make_chip(ui.chip_chain, ICON_CHAINS, C_CHAINS, L_CHIP_X, L_CHIP_Y);
 
+#ifndef WATCH206
     // Weight presets at the sides, just below the weight's baseline. Outer edge ~151 px
-    // from centre against the ring's 158 px.
+    // from centre against the ring's 158 px. Not on the watch.
     load_presets();
     make_preset(0, -122, 30);
     make_preset(1, 122, 30);
     refresh_presets();
+#endif
 
     // knob battery (bottom, inside the gap at the bottom of the ring)
     ui.lbl_kbat = make_label(ui.scr_main, &font_poppins_14, C_MUTED, "");
     lv_obj_align(ui.lbl_kbat, LV_ALIGN_BOTTOM_MID, 0, -6);
+
+    // Created last so it sits above every other main-screen widget. Invisible; shown
+    // only while loaded, when a tap anywhere unloads.
+    ui.unload_catcher = lv_obj_create(ui.scr_main);
+    lv_obj_remove_style_all(ui.unload_catcher);
+    lv_obj_set_size(ui.unload_catcher, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(ui.unload_catcher, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(ui.unload_catcher, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ui.unload_catcher, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ui.unload_catcher, on_center_clicked, LV_EVENT_CLICKED, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,12 +1281,27 @@ void build_settings()
 // ---------------------------------------------------------------------------
 // Connect screen
 // ---------------------------------------------------------------------------
+// Connect-list rows: a device index, or one of these.
+constexpr intptr_t ROW_DISCONNECT = -1;
+constexpr intptr_t ROW_UNTWIN = -2;
+constexpr intptr_t ROW_TWIN_BASE = 1000;   // + device index: twin with that device
+
 void on_device_clicked(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
     intptr_t idx = (intptr_t)lv_obj_get_user_data(btn);
     haptics_click();
     VClient &c = VClient::instance();
+    if (idx == ROW_UNTWIN) {
+        c.untwin();
+        return;
+    }
+    if (idx >= ROW_TWIN_BASE) {
+        // Stay on this screen: its status line follows the twin being set up.
+        const size_t i = (size_t)(idx - ROW_TWIN_BASE);
+        if (i < ui.devs.size()) c.twinWith(ui.devs[i]);
+        return;
+    }
     if (idx < 0) {
         c.disconnect();
         c.scanStart();
@@ -1113,8 +1332,16 @@ void rebuild_device_list()
         char buf[48];
         snprintf(buf, sizeof(buf), "Disconnect %s", name);
         lv_obj_t *b = lv_list_add_btn(ui.list, LV_SYMBOL_CLOSE, buf);
-        lv_obj_set_user_data(b, (void *)(intptr_t)-1);
+        lv_obj_set_user_data(b, (void *)ROW_DISCONNECT);
         lv_obj_set_style_text_color(b, C_DANGER, 0);
+        lv_obj_add_event_cb(b, on_device_clicked, LV_EVENT_CLICKED, nullptr);
+    }
+    // Twin mode: offered only on a ready connection, which becomes the host.
+    const bool ready = st.conn == ConnState::Ready;
+    if (ready && st.twin_state > voltra::TWIN_STATE_ALONE) {
+        lv_obj_t *b = lv_list_add_btn(ui.list, LV_SYMBOL_LOOP, "Un-twin");
+        lv_obj_set_user_data(b, (void *)ROW_UNTWIN);
+        lv_obj_set_style_text_color(b, C_WARN, 0);
         lv_obj_add_event_cb(b, on_device_clicked, LV_EVENT_CLICKED, nullptr);
     }
     for (size_t i = 0; i < ui.devs.size(); i++) {
@@ -1126,6 +1353,13 @@ void rebuild_device_list()
         lv_obj_set_user_data(b, (void *)(intptr_t)i);
         lv_obj_set_style_text_color(b, C_TEXT, 0);
         lv_obj_add_event_cb(b, on_device_clicked, LV_EVENT_CLICKED, nullptr);
+        if (ready && st.twin_state == voltra::TWIN_STATE_ALONE) {
+            snprintf(buf, sizeof(buf), "Twin with %s", d.name.c_str());
+            lv_obj_t *t = lv_list_add_btn(ui.list, LV_SYMBOL_LOOP, buf);
+            lv_obj_set_user_data(t, (void *)(ROW_TWIN_BASE + (intptr_t)i));
+            lv_obj_set_style_text_color(t, C_LOADED, 0);
+            lv_obj_add_event_cb(t, on_device_clicked, LV_EVENT_CLICKED, nullptr);
+        }
     }
     if (ui.devs.empty() && !st.connected()) {
         lv_obj_t *t = lv_list_add_text(ui.list, "No Voltra found yet.\nSwitch the Voltra on.");
@@ -1168,8 +1402,13 @@ void build_connect()
     lv_obj_align(ui.spinner, LV_ALIGN_TOP_MID, 0, 88);
 
     ui.list = lv_list_create(ui.scr_connect);
+#ifdef WATCH206
+    lv_obj_set_size(ui.list, 330, 220);   // room for the twin rows, clear of CLOSE
+    lv_obj_align(ui.list, LV_ALIGN_CENTER, 0, -8);
+#else
     lv_obj_set_size(ui.list, 236, 150);
     lv_obj_align(ui.list, LV_ALIGN_CENTER, 0, 18);
+#endif
     lv_obj_set_style_bg_color(ui.list, C_CARD, 0);
     lv_obj_set_style_border_width(ui.list, 0, 0);
     lv_obj_set_style_radius(ui.list, 18, 0);
@@ -1295,6 +1534,17 @@ void poll_cb(lv_timer_t *)
         ui.auto_load_pending_until = 0;
         if (ui.screen == Screen::Main) refresh_main();
     }
+    if (ui.st.load_refused != ui.last_load_refused) {
+        ui.last_load_refused = ui.st.load_refused;
+        ui.toggle_pending_until = 0;
+        ui.load_refused_until = now + LOAD_REFUSED_SHOW_MS;
+        haptics_buzz();
+        if (ui.screen == Screen::Main) refresh_main();
+    }
+    if (ui.load_refused_until && now >= ui.load_refused_until) {
+        ui.load_refused_until = 0;
+        if (ui.screen == Screen::Main) refresh_main();
+    }
     bool pending_expired = ui.toggle_pending_until && now >= ui.toggle_pending_until;
     if (pending_expired) ui.toggle_pending_until = 0;
 
@@ -1347,6 +1597,7 @@ void ui_init()
     build_connect();
     lv_scr_load(ui.scr_main);
     ui.st = VClient::instance().state();
+    ui.last_load_refused = ui.st.load_refused;
     refresh_main();
     lv_timer_create(poll_cb, 25, nullptr);
 }

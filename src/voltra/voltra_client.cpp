@@ -36,12 +36,23 @@ constexpr uint8_t  LOAD_MAX_RETRIES = 4;
 /** Auto load: how long to follow it after the trigger, and how often to read its countdown. */
 constexpr uint32_t AUTO_LOAD_WATCH_MS = 45000;
 constexpr uint32_t AUTO_LOAD_POLL_MS  = 250;
+// Twin mode (docs/PROTOCOL.md, "Twin mode").
+constexpr uint32_t TWIN_POLL_MS         = 10000;   // re-read the host's twin status
+constexpr uint32_t STATE_REFRESH_MS     = 500;     // twinned and loaded: as Beyond+ does
+constexpr uint32_t TWIN_SETTLE_MS       = 800;     // follower start-up before the join
+constexpr uint32_t TWIN_REPLY_TIMEOUT_MS = 4000;
 
 /**
  * Dump raw parameter traffic to the serial log. On only in the diagnostic build
  * (pio run -e remote_diag), which also sweeps every BP/MC register periodically.
  */
 bool s_log_params = VOLTRA_DIAG;
+
+// Diagnostic builds sweep every register periodically; 0 logs the traffic only. The
+// sweep's extra reads have coincided with dropped connections (docs/PROTOCOL.md).
+#ifndef VOLTRA_DIAG_SWEEP
+#define VOLTRA_DIAG_SWEEP 1
+#endif
 
 #if VOLTRA_DIAG
 constexpr uint32_t SWEEP_PERIOD_MS = 20000;   // start a full register sweep this often
@@ -82,6 +93,42 @@ const uint16_t PERCENT_PARAMS[] = {
 };
 constexpr size_t PERCENT_PARAM_COUNT = sizeof(PERCENT_PARAMS) / sizeof(PERCENT_PARAMS[0]);
 
+#if VOLTRA_DIAG
+/**
+ * Log every advertiser heard, not only Voltras: name, address, services, manufacturer
+ * data. Once per device, and again when its advertisement changes. For finding out what
+ * twinned Voltras advertise (README, "Twin mode").
+ */
+void log_advertiser(const NimBLEAdvertisedDevice *dev, const std::string &name, bool is_voltra)
+{
+    static std::vector<std::pair<std::string, std::string>> seen;   // address -> summary
+    char summary[200];
+    int o = snprintf(summary, sizeof(summary), "name='%s' type=%u conn=%d svc=", name.c_str(),
+                     (unsigned)dev->getAddress().getType(), dev->isConnectable() ? 1 : 0);
+    for (int i = 0; i < dev->getServiceUUIDCount() && o < (int)sizeof(summary) - 40; i++) {
+        o += snprintf(summary + o, sizeof(summary) - o, "%s%s", i ? "," : "",
+                      dev->getServiceUUID(i).toString().c_str());
+    }
+    const std::string mfg = dev->getManufacturerData();
+    o += snprintf(summary + o, sizeof(summary) - o, " mfg=");
+    for (size_t i = 0; i < mfg.size() && o < (int)sizeof(summary) - 3; i++) {
+        o += snprintf(summary + o, sizeof(summary) - o, "%02x", (uint8_t)mfg[i]);
+    }
+    const std::string addr = dev->getAddress().toString();
+    for (auto &e : seen) {
+        if (e.first == addr) {
+            if (e.second == summary) return;   // nothing new
+            e.second = summary;
+            log_i("scan: %s%s rssi %d %s (changed)", is_voltra ? "VOLTRA " : "", addr.c_str(),
+                  dev->getRSSI(), summary);
+            return;
+        }
+    }
+    if (seen.size() < 200) seen.emplace_back(addr, summary);
+    log_i("scan: %s%s rssi %d %s", is_voltra ? "VOLTRA " : "", addr.c_str(), dev->getRSSI(), summary);
+}
+#endif
+
 class ScanCb : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override
     {
@@ -90,6 +137,9 @@ class ScanCb : public NimBLEScanCallbacks {
                          name.find("VOLTRA") != std::string::npos ||
                          name.find("Voltra") != std::string::npos ||
                          dev->isAdvertisingService(NimBLEUUID(SERVICE_UUID));
+#if VOLTRA_DIAG
+        log_advertiser(dev, name, is_voltra);
+#endif
         Client::instance().onScanResult(name, dev->getAddress().toString(), dev->getAddress().getType(),
                                         dev->getRSSI(), is_voltra);
     }
@@ -102,8 +152,28 @@ class ClientCb : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient *, int reason) override { Client::instance().onDisconnected(reason); }
 };
 
+/** The short second connection used to twin (Client::joinFollower). Its disconnect must
+ *  not look like the main link dropping. */
+class AuxClientCb : public NimBLEClientCallbacks {
+    void onDisconnect(NimBLEClient *, int reason) override
+    {
+        log_i("twin: follower link closed, reason %d", reason);
+        Client::instance().onAuxDisconnected();
+    }
+};
+
 ScanCb s_scan_cb;
 ClientCb s_client_cb;
+AuxClientCb s_aux_cb;
+
+/** "80:b5:4e:07:02:a6" -> bytes in printed order, as the twin commands carry them. */
+bool parse_addr(const std::string &s, uint8_t out[6])
+{
+    unsigned b[6];
+    if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
+    for (int i = 0; i < 6; i++) out[i] = (uint8_t)b[i];
+    return true;
+}
 
 void task_entry(void *) { Client::instance().task(); }
 
@@ -127,6 +197,132 @@ void Client::lockState() const
 void Client::unlockState() const
 {
     if (mutex_) xSemaphoreGive((SemaphoreHandle_t)mutex_);
+}
+
+/** A load the Voltra would not do, typically with the cable pulled out (docs/PROTOCOL.md,
+ *  "Loading with the cable out"). The UI offers the override. */
+bool Client::isTwinned() const
+{
+    lockState();
+    const bool t = state_.twinned();
+    unlockState();
+    return t;
+}
+
+uint16_t Client::loadModeValue(bool load) const
+{
+    if (isTwinned()) return load ? FITNESS_MODE_TWIN_LOAD : FITNESS_MODE_TWIN_UNLOAD;
+    return load ? FITNESS_MODE_STRENGTH_LOADED : FITNESS_MODE_STRENGTH_READY;
+}
+
+void Client::twinWith(const FoundDevice &follower)
+{
+    lockState();
+    req_.twin = true;
+    req_.untwin = false;
+    req_.twin_target = follower;
+    unlockState();
+}
+
+void Client::untwin()
+{
+    lockState();
+    req_.untwin = true;
+    req_.twin = false;
+    unlockState();
+}
+
+void Client::queueTwinStatusRead()
+{
+    uint8_t buf[32];
+    enqueue(buf, build_frame(buf, sizeof(buf), CMD_TWIN_STATUS, nullptr, 0, nextSeq()));
+}
+
+void Client::onAuxNotify(uint8_t slot, const uint8_t *data, size_t len)
+{
+    if (slot >= 3) return;
+    aux_assemblers_[slot].accept(data, len,
+        [](void *ctx, const uint8_t *frame, size_t n) {
+            Packet pkt;
+            if (!parse_packet(frame, n, pkt) || pkt.cmd != CMD_TWIN_LINK || pkt.payload_len < 1) return;
+            log_i("twin: follower answered the join with %02x", pkt.payload[0]);
+            static_cast<Client *>(ctx)->aux_link_reply_ = pkt.payload[0];
+        }, this);
+}
+
+/**
+ * Tell `follower` to join `host_addr` (the unit on the main connection), as Beyond+ does:
+ * connect, run the usual start-up, send CMD_TWIN_LINK 01 + host address. The follower
+ * answers 00 and drops the link to go and join the host. Blocks the worker task for a few
+ * seconds; the main connection stays up throughout.
+ */
+bool Client::joinFollower(const FoundDevice &follower, const std::string &host_addr)
+{
+    uint8_t host[6];
+    if (!parse_addr(host_addr, host)) return false;
+    NimBLEClient *c = NimBLEDevice::createClient();
+    if (!c) return false;
+    c->setClientCallbacks(&s_aux_cb, false);
+    c->setConnectTimeout(8000);
+    aux_disconnected_ = false;
+    aux_link_reply_ = -1;
+    for (FrameAssembler &a : aux_assemblers_) a.clear();
+
+    bool ok = false;
+    log_i("twin: connecting to %s", follower.address.c_str());
+    do {
+        if (!c->connect(NimBLEAddress(follower.address, follower.addr_type), true, false, true)) {
+            log_w("twin: could not connect to %s", follower.address.c_str());
+            break;
+        }
+        NimBLERemoteService *svc = c->getService(NimBLEUUID(SERVICE_UUID));
+        NimBLERemoteCharacteristic *wr = svc ? svc->getCharacteristic(NimBLEUUID(CHAR_TRANSPORT_UUID)) : nullptr;
+        if (!wr) {
+            log_w("twin: %s has no Voltra service", follower.address.c_str());
+            break;
+        }
+        uint8_t buf[64];
+        size_t n = build_app_hello(buf, sizeof(buf), APP_NAME);
+        if (!wr->writeValue(buf, n, wr->canWrite())) break;
+        const char *uuids[3] = {CHAR_COMMAND_UUID, CHAR_NOTIFY_UUID, CHAR_TRANSPORT_UUID};
+        for (uint8_t slot = 0; slot < 3; slot++) {
+            NimBLERemoteCharacteristic *ch = svc->getCharacteristic(NimBLEUUID(uuids[slot]));
+            if (ch && ch->canNotify()) {
+                ch->subscribe(true,
+                    [slot](NimBLERemoteCharacteristic *, uint8_t *data, size_t len, bool) {
+                        Client::instance().onAuxNotify(slot, data, len);
+                    }, true);
+            }
+        }
+        // The same start-up as the main connection (and as Beyond+ before its join).
+        for (size_t i = 0; i < BOOTSTRAP_FRAME_COUNT; i++) {
+            wr->writeValue(BOOTSTRAP_FRAMES[i].data, BOOTSTRAP_FRAMES[i].len, wr->canWrite());
+            delay(WRITE_PACING_MS);
+        }
+        delay(TWIN_SETTLE_MS);
+
+        uint8_t join[7] = {TWIN_LINK_JOIN};
+        memcpy(join + 1, host, 6);
+        n = build_frame(buf, sizeof(buf), CMD_TWIN_LINK, join, sizeof(join), 100);
+        log_i("twin: asking %s to join %s", follower.address.c_str(), host_addr.c_str());
+        if (!wr->writeValue(buf, n, wr->canWrite())) break;
+        const uint32_t t0 = millis();
+        while (millis() - t0 < TWIN_REPLY_TIMEOUT_MS && aux_link_reply_ < 0 && !aux_disconnected_) delay(20);
+        // 00 = accepted. Dropping the link without a reply also means it went to join.
+        ok = aux_link_reply_ == 0 || (aux_link_reply_ < 0 && aux_disconnected_);
+    } while (false);
+
+    if (c->isConnected()) c->disconnect();
+    NimBLEDevice::deleteClient(c);
+    return ok;
+}
+
+void Client::noteLoadRefused()
+{
+    lockState();
+    state_.load_refused++;
+    unlockState();
+    bump();
 }
 
 void Client::guardModeEcho()
@@ -321,6 +517,17 @@ void Client::load()
     lockState();
     req_.load = true;
     req_.unload = false;
+    req_.load_override = false;
+    unlockState();
+}
+
+void Client::loadOverride()
+{
+    lockState();
+    req_.load_override = true;
+    req_.load = false;
+    req_.unload = false;
+    req_.auto_load = false;
     unlockState();
 }
 
@@ -330,6 +537,7 @@ void Client::unload()
     req_.unload = true;
     req_.load = false;
     req_.auto_load = false;
+    req_.load_override = false;
     unlockState();
 }
 
@@ -339,6 +547,7 @@ void Client::autoLoad()
     req_.auto_load = true;
     req_.load = false;
     req_.unload = false;
+    req_.load_override = false;
     unlockState();
 }
 
@@ -382,7 +591,7 @@ bool Client::takeRequests(Requests &out)
     req_ = Requests();
     unlockState();
     return out.scan_start || out.scan_stop || out.connect || out.disconnect || out.refresh || out.load ||
-           out.unload || out.auto_load || out.has_weight || out.has_chains || out.has_eccentric ||
+           out.unload || out.auto_load || out.load_override || out.twin || out.untwin || out.has_weight || out.has_chains || out.has_eccentric ||
            out.has_inverse || out.has_mountain;
 }
 
@@ -474,6 +683,8 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
     bool has_rep = parse_rep_telemetry(pkt, rep);
     const int workout_status = parse_workout_status(pkt);
     int activation = parse_activation(pkt);
+    TwinStatus twin;
+    const bool has_twin = parse_twin_status(pkt, twin);
 
     lockState();
     state_.last_rx_ms = millis();
@@ -551,6 +762,8 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
                 if (state_.inverse_chains != v) { state_.inverse_chains = v; changed = true; }
                 break;
             case PARAM_BP_SET_FITNESS_MODE: {
+                // Before the echo filters below: this echo is exactly what they drop.
+                if (v == FITNESS_MODE_TWIN_LOAD) twin_load_ack_ = true;
                 // The Voltra asynchronously echoes its whole settings block after a
                 // settings write and after reps, and the fitness mode in that echo is
                 // stale. Captured 100 ms apart while the device was loaded:
@@ -618,6 +831,26 @@ void Client::handleFrame(const uint8_t *frame, size_t len)
         state_.activation = activation;
         changed = true;
     }
+    if (has_twin) {
+        if (state_.twin_state != twin.state) {
+            log_i("twin status %02x", twin.state);
+            state_.twin_state = twin.state;
+            changed = true;
+        }
+        if (twin.has_addrs) {
+            char peer[20] = {0};
+            bool any = false;
+            for (uint8_t b : twin.peer) any |= b != 0;
+            if (any) {
+                snprintf(peer, sizeof(peer), "%02x:%02x:%02x:%02x:%02x:%02x", twin.peer[0], twin.peer[1],
+                         twin.peer[2], twin.peer[3], twin.peer[4], twin.peer[5]);
+            }
+            if (strcmp(peer, state_.twin_peer) != 0) {
+                strcpy(state_.twin_peer, peer);
+                changed = true;
+            }
+        }
+    }
 
     if (state_.conn == ConnState::Handshaking && state_.protocol_ok) {
         state_.conn = ConnState::Ready;
@@ -657,6 +890,7 @@ void Client::queueBootstrap()
     seq_ = 6;
     queueStatusRead();
     seq_ = std::max<uint16_t>(seq_, 7);
+    queueTwinStatusRead();
 }
 
 void Client::queueStatusRead()
@@ -762,6 +996,8 @@ void Client::teardown()
     q_head_ = q_tail_ = 0;
     lockState();
     state_.protocol_ok = false;
+    state_.twin_state = -1;
+    state_.twin_peer[0] = 0;
     state_.reps = 0;
     state_.sets = 0;
     state_.force_known = false;
@@ -992,13 +1228,22 @@ void Client::task()
                 if (s.workout_state <= WORKOUT_STATE_INACTIVE) {
                     queueParamWriteU8(PARAM_FITNESS_WORKOUT_STATE, WORKOUT_STATE_ACTIVE);
                 }
-                queueParamWriteU16(PARAM_BP_SET_FITNESS_MODE, FITNESS_MODE_STRENGTH_LOADED);
+                twin_load_ack_ = false;
+                queueParamWriteU16(PARAM_BP_SET_FITNESS_MODE, loadModeValue(true));
                 guardModeEcho();
                 load_intent_ = true;
                 load_intent_target_ = true;
                 load_retries_ = 0;
                 load_next_retry_ms_ = now + LOAD_RETRY_MS;
                 wrote_setting = true;
+            }
+            if (r.load_override) {
+                // User-confirmed on the watch: auto load, then the bypass written below
+                // once it waits for the pull.
+                [[maybe_unused]] const DeviceState s = state();   // for the log line only
+                log_w("override: auto load + bypass (mode=%d, cable %d cm)", s.fitness_mode, s.position_cm);
+                bypass_on_wait_ = true;
+                r.auto_load = true;   // handled just below
             }
             if (r.auto_load) {
                 // Same sequence as the Android port's "Direct Load at distance": make sure
@@ -1020,13 +1265,36 @@ void Client::task()
             }
             if (r.unload) {
                 auto_load_watch_until_ = 0;
-                queueParamWriteU16(PARAM_BP_SET_FITNESS_MODE, FITNESS_MODE_STRENGTH_READY);
+                bypass_on_wait_ = false;
+                queueParamWriteU16(PARAM_BP_SET_FITNESS_MODE, loadModeValue(false));
                 guardModeEcho();
                 load_intent_ = true;
                 load_intent_target_ = false;
                 load_retries_ = 0;
                 load_next_retry_ms_ = now + LOAD_RETRY_MS;
                 wrote_setting = true;
+            }
+            if (r.untwin) {
+                DeviceState s = state();
+                uint8_t leave[7] = {TWIN_LINK_LEAVE};
+                if (s.twin_peer[0] && parse_addr(s.twin_peer, leave + 1)) {
+                    log_i("twin: asking the host to drop %s", s.twin_peer);
+                    uint8_t buf[32];
+                    enqueue(buf, build_frame(buf, sizeof(buf), CMD_TWIN_LINK, leave, sizeof(leave), nextSeq()));
+                    queueTwinStatusRead();
+                } else {
+                    log_w("twin: un-twin requested but no follower known");
+                }
+            }
+            if (r.twin) {
+                const bool was_scanning = scanning_;
+                stopScan();
+                setStatus("Twinning...");
+                const bool ok = joinFollower(r.twin_target, target_addr_);
+                setStatus(ok ? "Twin: waiting for the follower" : "Twin failed");
+                queueTwinStatusRead();
+                last_twin_poll_ms_ = millis();
+                if (want_scan_ || was_scanning) startScan();
             }
             // Changing weight/chains/eccentric drops the Voltra from an active set (5) to
             // idle (1): a direct read right after a weight write returns "3E86=85 ...
@@ -1038,7 +1306,7 @@ void Client::task()
             // only armed when a set is already active, and the retry below re-checks the
             // reported mode before writing anything.
             const int mode_before = state().fitness_mode;
-            if (wrote_setting && !r.load && !r.unload && mode_before >= 0 &&
+            if (wrote_setting && !r.load && !r.unload && mode_before >= 0 && !isTwinned() &&
                 (mode_before & 0xFF) == FITNESS_MODE_STRENGTH_LOADED) {
                 load_intent_ = true;
                 load_intent_target_ = true;
@@ -1077,18 +1345,30 @@ void Client::task()
                 const int mode = reportedMode();
                 // A load is finished at an active set (5); an unload only once the device
                 // has left both loaded states, since idle (1) still has the weight on.
+                // Twinned, a load settles at idle (1), not an active set.
                 const bool done = load_intent_target_
-                                      ? mode >= 0 && (mode & 0xFF) == FITNESS_MODE_STRENGTH_LOADED
+                                      ? mode >= 0 && (isTwinned() ? voltra_loaded(mode, state().direct_load_status)
+                                                                  : (mode & 0xFF) == FITNESS_MODE_STRENGTH_LOADED)
                                       : mode >= 0 && !voltra_loaded(mode, state().direct_load_status);
+                // Refused outright: the Voltra answers a load it will not do (cable pulled
+                // out) by settling at ready (4), already at the first check. Loads that go
+                // through show 0, 1 or 5 there. Say so now instead of after every retry.
+                // Twinned the idle state reads like a refusal, so go by the host's echo.
+                const bool refused =
+                    load_intent_target_ && load_retries_ == 0 && mode >= 0 &&
+                    (isTwinned() ? !twin_load_ack_ && !voltra_loaded(mode, state().direct_load_status)
+                                 : (mode & 0xFF) == FITNESS_MODE_STRENGTH_READY);
                 if (done) {
                     load_intent_ = false;
+                } else if (refused) {
+                    load_intent_ = false;
+                    log_w("load refused (mode=%d, cable %d cm)", mode, state().position_cm);
+                    noteLoadRefused();
                 } else if (load_retries_ < LOAD_MAX_RETRIES) {
                     load_retries_++;
                     log_i("%s retry %u (mode=%d)", load_intent_target_ ? "load" : "unload",
                           load_retries_, mode);
-                    queueParamWriteU16(PARAM_BP_SET_FITNESS_MODE,
-                                       load_intent_target_ ? FITNESS_MODE_STRENGTH_LOADED
-                                                           : FITNESS_MODE_STRENGTH_READY);
+                    queueParamWriteU16(PARAM_BP_SET_FITNESS_MODE, loadModeValue(load_intent_target_));
                     guardModeEcho();
                     queueStatusRead();
                     last_poll_ms_ = now;
@@ -1097,10 +1377,14 @@ void Client::task()
                     load_intent_ = false;
                     log_w("%s did not reach the target state (mode=%d)",
                           load_intent_target_ ? "load" : "unload", mode);
+                    // Only when the weight is still off: a load that stopped at idle (1) is on.
+                    if (load_intent_target_ && !voltra_loaded(mode, state().direct_load_status)) {
+                        noteLoadRefused();
+                    }
                 }
             }
 
-#if VOLTRA_DIAG
+#if VOLTRA_DIAG && VOLTRA_DIAG_SWEEP
             // Diagnostic sweep: read every BP/MC register so snapshots taken in different
             // device states can be diffed offline to find undocumented registers.
             if (conn == ConnState::Ready) {
@@ -1134,8 +1418,17 @@ void Client::task()
                 // mode only changes after the trigger has gone out.
                 const bool finished = now - auto_load_started_ms_ > 2000 && s.loaded() &&
                                       !s.auto_loading() && s.direct_load_countdown_ms == 0;
+                if (bypass_on_wait_ && s.auto_loading() && s.direct_load_status >= DIRECT_LOAD_ST_WAITING) {
+                    // Auto load is waiting for the pull (or counting down): 2 bypasses the
+                    // check and it loads at once (1 would cancel it).
+                    log_w("override: writing 2 to 0x53C9 (auto load status %d)", s.direct_load_status);
+                    queueParamWriteU8(PARAM_DIRECT_LOAD_SAFETY_CTRL, 2);
+                    queueDirectLoadRead();
+                    bypass_on_wait_ = false;
+                }
                 if (expired || finished) {
                     auto_load_watch_until_ = 0;
+                    bypass_on_wait_ = false;
                 } else if (queueEmpty() && now - last_auto_load_poll_ms_ >= AUTO_LOAD_POLL_MS) {
                     queueDirectLoadRead();
                     last_auto_load_poll_ms_ = now;
@@ -1144,6 +1437,20 @@ void Client::task()
             if (conn == ConnState::Ready && queueEmpty() && now - last_poll_ms_ >= STATUS_POLL_MS) {
                 queueStatusRead();
                 last_poll_ms_ = now;
+            }
+            if (conn == ConnState::Ready && queueEmpty() && now - last_twin_poll_ms_ >= TWIN_POLL_MS) {
+                queueTwinStatusRead();
+                last_twin_poll_ms_ = now;
+            }
+            if (conn == ConnState::Ready && queueDepth() <= 1 && now - last_refresh_ms_ >= STATE_REFRESH_MS) {
+                const DeviceState s = state();
+                if (s.twinned() && s.loaded()) {
+                    // Beyond+ repeats this every 0.5 s while the twin is loaded.
+                    const uint8_t refresh[] = {VENDOR_STATE_REFRESH, 0x01};
+                    uint8_t buf[32];
+                    enqueue(buf, build_vendor(buf, sizeof(buf), refresh, sizeof(refresh), nextSeq()));
+                }
+                last_refresh_ms_ = now;
             }
             if (!queueEmpty() && now - last_write_ms_ >= WRITE_PACING_MS) {
                 if (!writeNext()) {
