@@ -26,10 +26,13 @@ The tick marks around the screen edge show the weight; they turn green while loa
 
 ## What you need
 
-- Waveshare **ESP32-S3-Touch-AMOLED-2.06** (the ESP32-S3 version, not the C6)
+- Waveshare **ESP32-S3-Touch-AMOLED-2.06** (the ESP32-S3 version, not the C6), either:
+  - [the watch on its own](https://www.amazon.ca/dp/B0FJFNXGNX), or
+  - [the watch with a battery](https://www.amazon.ca/gp/product/B0FJFP6VLJ)
+- For running unplugged, if your watch came without one: a 3.7 V LiPo with an MX1.25
+  plug, such as [this one](https://www.amazon.ca/dp/B08215N9R8). **Its plug is wired the
+  other way round and has to be re-pinned first** (see step 4).
 - A USB-C data cable
-- Optional: a 3.7 V LiPo with an MX1.25 plug for running unplugged (for example an
-  EEMB 402535, 320 mAh)
 - A Mac, Linux or Windows computer
 
 ## Load it onto a new watch
@@ -72,8 +75,13 @@ different pins (GPIO 8 is the watch's display reset).
 
 **Check the polarity before plugging a battery in.** The red wire must go to the **+** pad
 marked on the board. Aftermarket batteries with the same plug are sometimes wired the other
-way round; a reversed battery is not detected and the watch will not run unplugged (and it
-risks damaging the board).
+way round, including the one linked above; a reversed battery is not detected and the
+watch will not run unplugged (and it risks damaging the board).
+
+To swap a reversed plug: with a pin, gently lift the small plastic latch over each metal
+contact on the plug and slide the wire out, then push the two wires back in on the
+opposite sides until they click. Keep the bare contacts from touching each other while
+they are out.
 
 The watch charges the battery over USB-C. Its level shows at the bottom of the screen.
 
