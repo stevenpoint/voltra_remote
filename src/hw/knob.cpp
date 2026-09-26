@@ -1,5 +1,51 @@
 #include "knob.h"
 
+#ifdef WATCH206
+// No encoder on the watch: vertical swipes on the touchscreen stand in for it.
+#include <atomic>
+#include <stdlib.h>
+
+namespace {
+constexpr int DRAG_START_PX = 12;   // movement before a touch counts as a swipe, not a tap
+constexpr int DETENT_PX = 24;       // finger travel per virtual detent
+
+std::atomic<int> s_delta{0};
+bool s_down = false;
+bool s_dragging = false;
+int s_anchor_y = 0;
+}  // namespace
+
+void knob_init() {}
+
+bool knob_touch(bool pressed, int y)
+{
+    if (!pressed) {
+        s_down = false;
+        s_dragging = false;
+        return false;
+    }
+    if (!s_down) {
+        s_down = true;
+        s_anchor_y = y;
+        return false;
+    }
+    if (!s_dragging) {
+        if (abs(y - s_anchor_y) < DRAG_START_PX) return false;
+        s_dragging = true;
+        s_anchor_y = y;
+    }
+    // Swipe up = clockwise (value up).
+    const int detents = (s_anchor_y - y) / DETENT_PX;
+    if (detents) {
+        s_delta += detents;
+        s_anchor_y -= detents * DETENT_PX;
+    }
+    return true;
+}
+
+int knob_take_delta() { return s_delta.exchange(0); }
+#else
+
 #include <Arduino.h>
 #include <atomic>
 
@@ -92,3 +138,4 @@ int knob_take_delta()
 #endif
     return d;
 }
+#endif

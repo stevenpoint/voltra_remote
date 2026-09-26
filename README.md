@@ -1,190 +1,178 @@
-# Voltra Remote
+# Voltra Watch
 
-A dedicated Bluetooth remote for the **Beyond Power Voltra I**, built on the
-[Waveshare ESP32-S3-Knob-Touch-LCD-1.8](https://www.waveshare.com/wiki/ESP32-S3-Knob-Touch-LCD-1.8):
-a round touchscreen with a rotary knob and haptics. Set the weight, load and unload,
-and control chains, inverse chains, mountain, and eccentric, without reaching for the
-Voltra's screen or your phone.
+Bar remote for a Beyond Power VOLTRA I on the Waveshare **ESP32-S3-Touch-AMOLED-2.06** watch.
 
-> **Unofficial.** Voltra Remote is an independent project, not affiliated with or endorsed
-> by Beyond Power. It drives the Voltra through a reverse-engineered protocol, and a
-> firmware update could change that protocol. Use it at your own risk, and keep clear of
-> the cable when loading.
+Not affiliated with Beyond Power or Waveshare.
 
-```
-            ┌──────────────────────────┐
-            │       ᛒ   ▮▮▮ 78%        │   <- Voltra battery; tap: connect menu
-            │      Tap to Unload       │
-            │                          │
-            │          45  lb          │   <- turn: weight · tap: load / unload
-            │ (60)                (90) │      hold: auto load
-            │                          │   <- presets: tap to send, hold to store
-            │  ┌────┐  ┌────┐  ┌────┐  │
-            │  │ ⩔  │  │ ⁘  │  │ 8  │  │   <- active accessories either side of
-            │  │+25%│  └────┘  │10% │  │      the settings button
-            │  └────┘          └────┘  │
-            └──────────────────────────┘
-```
+A port of [kirby6365/voltra_remote](https://github.com/kirby6365/voltra_remote) (MIT), the
+Voltra remote for the Waveshare ESP32-S3-Knob-Touch-LCD-1.8, to the 2.06" watch. The knob
+build is kept alongside. Protocol work builds on Omar Shahine's
+[voltra-knob](https://github.com/omarshahine/voltra-knob), dylanmaniatakes'
+Beyond-Power-HomeAssistant / Beyond-Power-Voltra-Android and jpamorgan's voltra-sdk.
 
-## Features
+<table>
+<tr>
+<td align="center"><img src="docs/screenshots/main.png" width="205" alt="Main screen: 90 lb, the Voltra's 45 plus a 45 lb attachment, with eccentric and attachment dials"><br>Ready to load</td>
+<td align="center"><img src="docs/screenshots/set.png" width="205" alt="During a set: 60 lb on the return with +15 eccentric, set 2, 7 reps"><br>During a set</td>
+<td align="center"><img src="docs/screenshots/settings.png" width="205" alt="Settings list: attachment, eccentric, chains, inverse chains, mountain"><br>Settings</td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/eccentric.png" width="205" alt="Eccentric dial at +15 lb with quick picks"><br>Eccentric</td>
+<td align="center"><img src="docs/screenshots/attachment.png" width="205" alt="Attachment dial at 45 lb, 90 lb in total"><br>Attachment</td>
+<td align="center"><img src="docs/screenshots/connect.png" width="205" alt="Connect screen listing nearby Voltras"><br>Connect</td>
+</tr>
+</table>
 
-- **Weight on the dial.** Turn slowly for 1 lb steps, spin for 5 lb steps that snap to
-  multiples of 5. The limit is read from the Voltra (230 lb on current firmware).
-- **Load, unload and auto load.** Tap the weight to load or unload. Press and hold it to
-  start the Voltra's own auto load: pull the cable out and hold it, and it loads after a
-  3-second countdown that the knob shows too.
-- **Always in step with the Voltra.** The screen follows what the Voltra reports, so
-  changes made on the Voltra itself show up on the knob. The weight is a dim green while
-  unloaded and bright green once loaded, and resting between sets still counts as loaded.
-- **Set screen.** During a set, everything else clears away and the set and rep counts
-  fill the lower half. Until the first rep, the rep count pulses like the Voltra's.
-- **Two weight presets.** Hold a preset to store the current weight, tap it to send that
-  weight. They are stored on the knob and survive a restart.
-- **Accessories** with the Voltra's own icons: eccentric, chains, inverse chains and
-  mountain. The last three are mutually exclusive, as on the Voltra. Amounts follow the
-  Voltra's lb/% setting, with the other unit shown alongside.
-- **Status at a glance.** Bluetooth icon (blue when connected), the Voltra's battery, and
-  the knob's own battery. Haptic clicks confirm every action.
+Screenshots come straight off the watch (`tools/screenshot.py`).
+
+## What it does
+
+| Gesture | Action |
+|---|---|
+| Tap the weight | Load if unloaded |
+| Tap anywhere while loaded | Unload |
+| Hold the weight | Voltra auto load (pull and hold the cable, 3 s countdown) |
+| Tap again on "CABLE OUT: TAP TO OVERRIDE" | Load at once with the cable pulled out |
+| Swipe up / down | Weight +/- 1 lb, 5 lb steps when swiping fast |
+| Gear button | Settings: attachment, eccentric, chains, inverse chains, mountain |
+| Tap an accessory dial under the weight | Adjust that accessory |
+| Tap the Bluetooth bar at the top | Connect screen: pick a Voltra, twin, un-twin |
+
+The rail around the screen edge shows the weight: white while unloaded, green while loaded.
+With eccentric on, the weight follows each rep: the base weight on the pull, and base
+plus eccentric on the way back (from the second rep, once the Voltra knows the rep
+length). The line under the weight says which.
+
+**Attachment** (0 to 50 lb) is the weight of whatever hangs on the cable, such as a bar. It
+is added to the weight on screen but never sent to the Voltra: with a 50 lb attachment and
+the Voltra at 30 lb, the screen shows 80 lb. It is remembered across restarts.
+
+The watch switches itself off after 10 minutes without a touch, unless the Voltra is
+loaded or the watch is plugged in. The side button turns it back on.
 
 ## What you need
 
-- A Beyond Power **Voltra I**. Tested against current firmware, with the 230 lb limit.
-- A **Waveshare ESP32-S3-Knob-Touch-LCD-1.8**.
-- A USB-C data cable, and a computer with [PlatformIO](https://platformio.org/) (the
-  VS Code extension, or the `pio` command line).
+- Waveshare **ESP32-S3-Touch-AMOLED-2.06** (the ESP32-S3 version, not the C6), either:
+  - [the watch on its own](https://www.amazon.ca/dp/B0FJFNXGNX), or
+  - [the watch with a battery](https://www.amazon.ca/gp/product/B0FJFP6VLJ)
+- For running unplugged, if your watch came without one: a 3.7 V LiPo with an MX1.25
+  plug, such as [this one](https://www.amazon.ca/dp/B08215N9R8). **Its plug is wired the
+  other way round and has to be re-pinned first** (see step 4).
+- A USB-C data cable
+- A Mac, Linux or Windows computer
 
-## Installing
+## Load it onto a new watch
 
-1. Clone this repository and open a terminal in it.
-2. Connect the knob over USB-C. The board has two chips behind a USB switch: the ESP32-S3
-   shows up as an Espressif USB device (VID:PID `303A:1001`). If you get a CH340 serial
-   port instead, flip the USB-C plug over.
-3. Build and flash:
+### 1. Install PlatformIO
 
-   ```bash
-   pio run -e remote -t upload
-   ```
+Either the [PlatformIO extension for VS Code](https://platformio.org/install/ide?install=vscode),
+or the command line:
 
-   The first build downloads the toolchain and libraries, which takes a few minutes.
-
-**Windows:** build from PowerShell or cmd, not Git Bash/MSYS. The toolchain installer
-refuses to run under MSYS and leaves the compiler missing, so the build then fails
-with `'xtensa-esp32s3-elf-gcc' is not recognized`.
-
-Each build also writes a single flashable image, `.pio/build/remote/firmware.factory.bin`,
-which can be written at offset `0x0` with any ESP32 flasher, such as
-[ESP Web Flasher](https://espressif.github.io/esptool-js/).
-
-## Using it
-
-**First connection.** Switch the Voltra on and tap the top of the knob's screen (or the
-weight, while disconnected) to open the connect menu. Tap your Voltra (`VTR-…`) in the
-list. The knob remembers it and reconnects by itself from then on. To disconnect, open
-the connect menu again.
-
-**Main screen**
-
-| Do this | To |
-|---|---|
-| Turn the knob | set the weight (slow: 1 lb, fast: 5 lb) |
-| Tap the weight | load / unload |
-| Press and hold the weight | start auto load; tap again to cancel it before it loads |
-| Tap a preset | send its weight |
-| Press and hold a preset | store the current weight in it |
-| Tap an accessory bubble | adjust that accessory |
-| Tap the five-dot button | open the accessory settings |
-
-**Accessory settings.** Four bubbles: Eccentric, Chains, Mountain and Inverse. Tap one
-and turn the knob to set its amount, then tap Done. Dialling an amount into Chains,
-Mountain or Inverse switches the Voltra to that style and turns the other two off. The
-five-dot button turns green while any accessory is on.
-
-## Troubleshooting
-
-- **The Voltra doesn't appear in the connect menu.** Make sure it is switched on, and
-  close the Beyond+ app on your phone if it is connected: the Voltra may not advertise
-  while another app holds the connection.
-- **Turning the knob does nothing, or double-counts.** Build with `-DKNOB_QUADRATURE=1`
-  in `platformio.ini`. If it counts backwards, add `-DKNOB_INVERT=1`.
-- **Something on the knob disagrees with the Voltra.** The knob re-reads the Voltra
-  every few seconds; if it stays wrong, open an issue with what you did on each device.
-
-## Development
-
-| Path | What |
-|---|---|
-| `src/voltra/voltra_protocol.*` | Frame builder/parser, CRCs, parameter registry. No Arduino dependencies, so it is unit-tested on the host. |
-| `src/voltra/voltra_client.*` | NimBLE central: scan, connect, handshake, paced writes, load handling, device state. |
-| `src/ui/ui.cpp` | LVGL 8 screens: main, set, accessory settings, adjust dial, connect menu. |
-| `src/ui/knob_step.h` | Fine/coarse knob stepping and snapping (unit-tested). |
-| `src/ui/fonts/` | Generated fonts: Poppins text and numbers, and the icon font. |
-| `src/hw/` | Board drivers: QSPI ST77916 panel and LVGL port, CST816 touch, knob, DRV2605 haptics, battery. |
-| `include/lv_conf.h` | LVGL configuration. |
-| `tools/` | Font and icon generators, the diagnostic sweep generator, and the Poppins font files. |
-| `test/test_protocol/` | Unity tests, mostly against frames captured from the Voltra and the official app. |
-| `docs/PROTOCOL.md` | Everything known about the Voltra's BLE protocol. |
-
-**Tests.** 25 host-side tests cover the frame builder and parser against captured
-frames, the knob stepping, and the load, auto-load and workout-status logic:
-
-```bash
-pio test -e native
+```
+brew install platformio        # macOS
+pip install platformio         # anywhere with Python 3
 ```
 
-**Builds.** `remote` is the release build and prints nothing over serial. `remote_diag`
-adds full logging and a register sweep for protocol work; see
-[docs/PROTOCOL.md](docs/PROTOCOL.md#finding-undocumented-registers).
+### 2. Get the code
 
-**Fonts and icons.** The generated files are committed; regenerate them only to change a
-size or a shape. Both generators need Python with Pillow. The UI is set in Poppins:
-Medium for text, Bold for numbers. The text sizes fall back to LVGL's built-in
-Montserrat for the Bluetooth and battery symbols, which Poppins lacks.
-
-```bash
-# text, 14/16/18/20/22 px (16 shown)
-python tools/gen_font.py --ttf tools/Poppins-Medium.ttf --size 16 --ascii \
-    --fallback lv_font_montserrat_16 --name font_poppins_16 --out src/ui/fonts/font_poppins_16.c
-# the weight and dial values, and the set / rep counters
-python tools/gen_font.py --ttf tools/Poppins-Bold.ttf --size 96 --chars "0123456789-+" \
-    --name font_poppins_96 --out src/ui/fonts/font_poppins_96.c
-python tools/gen_font.py --ttf tools/Poppins-Bold.ttf --size 64 --chars "0123456789" \
-    --name font_poppins_bold_64 --out src/ui/fonts/font_poppins_bold_64.c
-# icons: drawn from shapes, at U+E000-U+E004 (the ICON_* macros in ui.cpp)
-python tools/gen_icons.py --size 26 --name font_icons_26 --out src/ui/fonts/font_icons_26.c --preview icons.png
-python tools/gen_icons.py --size 18 --name font_icons_18 --out src/ui/fonts/font_icons_18.c
+```
+git clone https://github.com/stevenpoint/voltra_remote.git
+cd voltra_remote
 ```
 
-**Board pins** (ESP32-S3 side):
+### 3. Flash the watch
 
-| Function | GPIO |
+Plug the watch in over USB-C, then:
+
+```
+pio run -e watch206 -t upload
+```
+
+The first build downloads the ESP32 toolchain and libraries, which takes a few minutes.
+The watch restarts into the remote when the upload finishes.
+
+If the upload cannot find the watch, hold the **BOOT** button while plugging it in, release
+it once the port appears, and upload again.
+
+Use only the `watch206` build on the watch. The `remote` build is for the knob and uses
+different pins (GPIO 8 is the watch's display reset).
+
+### 4. Fit the battery (optional)
+
+**Check the polarity before plugging a battery in.** The red wire must go to the **+** pad
+marked on the board. Aftermarket batteries with the same plug are sometimes wired the other
+way round, including the one linked above; a reversed battery is not detected and the
+watch will not run unplugged (and it risks damaging the board).
+
+To swap a reversed plug: with a pin, gently lift the small plastic latch over each metal
+contact on the plug and slide the wire out, then push the two wires back in on the
+opposite sides until they click. Keep the bare contacts from touching each other while
+they are out.
+
+The watch charges the battery over USB-C. Its level shows at the bottom of the screen.
+
+### 5. Connect to your Voltra
+
+1. Close **Beyond+** on your phone first. The Voltra only keeps one controller.
+2. On the watch, tap the Bluetooth bar at the top to open the Connect screen.
+3. Tap your Voltra (`VTR-...`) in the list.
+
+The watch remembers it and reconnects by itself next time. The watch never loads the
+Voltra on its own: at start-up it only connects.
+
+## Twin mode
+
+Twin the Voltras **from the watch**, not from the Voltras' own screens: a hosting Voltra
+stops advertising, so a remote can only drive the pair over a connection it made before
+twinning (the way Beyond+ does it; see `docs/PROTOCOL.md`, "Twin mode").
+
+1. Connect to the Voltra that should host.
+2. Open the Connect screen and tap **Twin with VTR-...** under the other Voltra.
+3. The top bar shows **TWIN** and both Voltras' batteries (host first); weight, load,
+   unload and the cable-out override now drive both, and the weight shows the pair's total.
+4. **Un-twin** on the Connect screen undoes it.
+
+If the watch loses the host while twinned it keeps retrying; reconnecting can take a
+minute or so, and if it does not, un-twin on the Voltras and set the twin up again.
+
+## Safety
+
+- The watch only loads when you tap, hold or confirm the override. It never loads on
+  start-up or after reconnecting.
+- If Bluetooth drops, the watch shows it is disconnected and leaves the Voltra as it is.
+- The cable-out override loads at once with the cable pulled out, skipping the Voltra's own
+  hold-still check. Use it with a firm grip.
+- Straps and printed parts are not a failsafe. Unload from the Voltra itself if anything
+  feels wrong.
+
+## Code layout
+
+```
+src/main.cpp              start-up
+src/hw/                   display (display_watch206.cpp on the watch), touch, battery,
+                          knob (swipes stand in for it on the watch)
+src/ui/ui.cpp             screens; WATCH206 sections hold the watch layout
+src/voltra/               BLE client and protocol (voltra_protocol.* is host-tested)
+src/diag/flash_log.*      diagnostic builds: keeps the log in flash
+docs/PROTOCOL.md          the Voltra protocol, including cable-out and twin captures
+tools/                    font and icon generators, pull_log.py
+```
+
+Builds, from `platformio.ini`:
+
+| Build | For |
 |---|---|
-| LCD QSPI CS / SCK / D0–D3 / RST / backlight | 14 / 13 / 15, 16, 17, 18 / 21 / 47 |
-| I²C SDA / SCL (CST816 touch `0x15`, DRV2605 haptics `0x5A`) | 11 / 12 |
-| Touch INT / RST | 9 / 10 |
-| Knob A / B | 8 / 7 |
-| Battery ADC (10k/10k divider) | 1 |
+| `watch206` | The watch |
+| `watch206_diag` | The watch, logging all Voltra traffic to flash |
+| `watch206_sweep` | As `watch206_diag`, plus a full register read every ~40 s |
+| `remote` / `remote_diag` | The original knob |
+| `native` | Protocol unit tests: `pio test -e native` |
 
-## License
+To capture Voltra traffic away from a computer, flash `watch206_diag`, use the watch at
+the Voltra, then plug it back in and run:
 
-Voltra Remote is released under the [MIT License](LICENSE). The generated font files in
-`src/ui/fonts/font_poppins_*.c` embed glyphs from Poppins and remain under the SIL Open
-Font License; the third-party components below keep their own licences.
+```
+~/.platformio/penv/bin/python tools/pull_log.py
+```
 
-## Credits
-
-The protocol work builds on community reverse-engineering by
-[dylanmaniatakes/Beyond-Power-HomeAssistant](https://github.com/dylanmaniatakes/Beyond-Power-HomeAssistant),
-[dylanmaniatakes/Beyond-Power-Voltra-Android](https://github.com/dylanmaniatakes/Beyond-Power-Voltra-Android)
-and [jpamorgan/voltra-sdk](https://github.com/jpamorgan/voltra-sdk). The accessory and
-settings icons are redrawn after the Voltra's own.
-
-Third-party components:
-
-- [LVGL](https://lvgl.io/): MIT License.
-- [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino): Apache License 2.0.
-- [Poppins](https://github.com/itfoundry/Poppins) (via Google Fonts) and LVGL's built-in
-  Montserrat: SIL Open Font License 1.1 (`tools/Poppins-OFL.txt`).
-- [Arduino core for ESP32](https://github.com/espressif/arduino-esp32): LGPL 2.1; ESP-IDF: Apache License 2.0.
-
-Beyond Power and Voltra are trademarks of their respective owner, used here only to
-identify the device this remote works with.
+This saves the log to `voltra_capture.log`; `--clear` wipes it from the watch afterwards.

@@ -1,3 +1,4 @@
+#ifndef WATCH206
 /*
  * SPDX-FileCopyrightText: 2023 Espressif Systems (Shanghai) CO LTD
  * SPDX-License-Identifier: Apache-2.0
@@ -390,3 +391,4 @@ esp_err_t lcd_qspi_panel_create(esp_lcd_panel_io_handle_t io, int reset_gpio_num
     *ret_panel = &p->base;
     return ESP_OK;
 }
+#endif

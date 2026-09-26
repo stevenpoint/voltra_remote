@@ -87,7 +87,7 @@
 #define LV_FONT_CUSTOM_DECLARE LV_FONT_DECLARE(font_icons_26) LV_FONT_DECLARE(font_icons_18) \
     LV_FONT_DECLARE(font_poppins_14) LV_FONT_DECLARE(font_poppins_16) LV_FONT_DECLARE(font_poppins_18) \
     LV_FONT_DECLARE(font_poppins_20) LV_FONT_DECLARE(font_poppins_22) LV_FONT_DECLARE(font_poppins_96) \
-    LV_FONT_DECLARE(font_poppins_bold_64)
+    LV_FONT_DECLARE(font_poppins_bold_64) LV_FONT_DECLARE(font_poppins_160)
 
 #define LV_FONT_DEFAULT &font_poppins_16
 #define LV_FONT_FMT_TXT_LARGE 0
@@ -160,6 +160,9 @@
 
 #define LV_USE_FLEX 1
 #define LV_USE_GRID 0
+
+/* Screenshots over USB serial (ui_command "shot") */
+#define LV_USE_SNAPSHOT 1
 
 /*==================
  * DEMOS / EXAMPLES

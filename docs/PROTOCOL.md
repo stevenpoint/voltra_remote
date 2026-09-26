@@ -98,7 +98,8 @@ The Voltra pushes workout telemetry on command `0xAA`. Two frames matter here:
 
 - **Rep telemetry** `81 2B phase set rep_hi rep_lo …`: `phase` is `0` idle, `1` pull,
   `2` transition, `3` return; `set` is the Voltra's set counter; the rep count is
-  big-endian.
+  big-endian. A twinned host sends `81 42` instead (68 bytes rather than 45), with the
+  same phase, set and rep bytes at the start (*captured*).
 - **Workout status** `80 25 01 00 SS …`, pushed the moment it changes (*captured*):
 
   | `SS` | Meaning |
@@ -134,6 +135,36 @@ after loading**, so the mode alone cannot say whether the weight is on.
 The knob counts `0x23` with `13` or `14` as loaded. Writing `4` (unload) during the wait
 cancels it. The Android port lists fitness modes `0x26` / `0x27` for this on its
 firmware; those are treated the same way.
+
+### Loading with the cable out
+
+*Captured* (Watch 2.06 diag build):
+
+- A plain load (`0x3E89` = `5`) with the cable pulled out (41 cm) is refused: the mode
+  echoes `4` and falls back to `0` within ~200 ms, every retry. No safety-check register
+  (`0x53C7` / `0x53C8` / `0x53C9`) changes, so the Voltra gives a remote nothing to
+  answer. The same load with the cable near home (11 cm) goes through.
+  A refused load already reads back as `4` at the first check (~0.6 s after the write);
+  loads that go through read `0`, `1` or `5` there, so the watch calls it refused then.
+- The Voltra's own "cable out" prompt, answered with **override** on its screen, shows
+  up only as the mode going `4` -> `1` (loaded) with the cable at 31 cm. `0x53C7` and
+  `0x53C9` stay `0`. **Cancel** changes nothing visible.
+- Auto load with the cable out works: `0x53C7` `11` -> `12` (countdown `0x53C8` from
+  ~2200 ms) -> `13` -> `14`.
+- Writing mode `1` after a refusal, to copy the Voltra's own override, is refused too:
+  the Voltra answers with mode `0` (cable at 53-58 cm, captured twice). A remote cannot
+  override the cable-out check this way.
+- `DIRECT_LOAD_SAFETY_CHECK_CTRL` (`0x53C9`, "cancel / bypass") is writable and reads
+  back. Writing `1` or `2` before a plain load changes nothing: the load is still
+  refused. Writing `1` during an auto-load countdown **cancels** the auto load at once
+  (`0x53C7` `12` -> `0`, mode `0x23` -> `0`).
+- **Override from a remote** (`Client::loadOverride()`): start auto load, then write `2`
+  (**bypass**) while it waits (`0x53C7` = `11`). The Voltra skips the pull-and-hold
+  countdown and loads at once: `0x53C7` `11` -> `14`, mode `0x23` -> `1`, about 0.2 s
+  after the write, with the cable at 43 cm (captured).
+
+The link has dropped (reason 520, supervision timeout) in every watch capture, with and
+without the diagnostic register sweep (`VOLTRA_DIAG_SWEEP=0` in `watch206_diag`).
 
 ## Chains and eccentric units
 
@@ -187,3 +218,64 @@ The method:
    The diff only identifies the register: Mountain's polarity was first read backwards.
 
 Flash the release build (`pio run -e remote -t upload`) afterwards; it carries none of this.
+
+## Twin mode
+
+*Captured* with two units, VTR-002166 hosting the twin and VTR-066162 following:
+
+- While hosting, the host **stops advertising** and does not accept connections, so a
+  remote cannot reach it after the twin is set up.
+- The follower keeps advertising (same name and service) and accepts a connection, but
+  commands sent to it act on the follower only: a load through it lit the follower's
+  twin icon and left the host unchanged. The follower does not relay to the host.
+- Two registers on the follower change with twinning (the host was read only before
+  it hosted, when both were zero):
+
+  | Register | Not twinned | Follower, twinned |
+  |---|---|---|
+  | `0x516C` (u8) | `00` | `02` (twin role? 1 = host would fit) |
+  | `0x521F` (4 bytes) | `00000000` | `01 39 00 02` |
+
+A unit also refuses to twin from its own screen while a remote is connected to it.
+
+### How Beyond+ twins (iPhone PacketLogger capture)
+
+The app connects to **both** units (normal handshake on each), then:
+
+1. To the future **follower** only: vendor-style command `0xA8`, payload `01` + host
+   address (6 bytes, as printed: `80 b5 4e 07 02 a6`). Reply `00 01 00`; the follower then
+   drops the app and joins the host itself.
+2. The app **keeps its connection to the host**. A hosting unit stops advertising but keeps
+   connections it already has, which is how the app can still drive it.
+3. The host reports the twin unprompted. Command `0xA7` (twin status, empty request) answers
+   `BB 01 SS <own addr> <peer addr> ...`, with a leading `00` status byte when it is a reply
+   rather than a push. `BB` is the unit's battery % (`39` at 57 %, `35` at 53 %), not a
+   fixed marker. `SS` = `00` alone, `11` then `12` once the follower is in, with the
+   follower's address as peer. The byte after the peer address is the follower's battery %
+   (`34` with the host at `35`; `00` when alone). It also pushes `0x521F` = `01 BB 00 02`.
+4. `0xA9 01` / `0xA9 03` to the host return the follower's name (`VTR-066162`) and serial:
+   queries, not part of the setup.
+
+Driving the pair, everything to the host:
+
+- Weight: the usual `0x3E86`.
+- Load: fitness mode **`0x0101`**; unload: **`0x0100`** (single unit: `0x0005` / `0x0004`).
+  The host echoes mode `1` / `0`.
+- While loaded the app sends `0xAA 13 01` every 0.5 s (answered `00 13 00`); purpose unknown.
+
+Un-twin: to the host, `0xA8` with `02` + follower address (reply `00 02 00`).
+
+A twinned host does not show up in scans, but the watch has reconnected to one by address
+after about 50 s of retries (captured once), so a lost link is not always final.
+
+Twinned, the host's fitness mode changes shape (captured from the watch):
+
+| | Single unit | Twinned host |
+|---|---|---|
+| Idle / unloaded | `0` or `4` | `0x0100` |
+| Loaded | `1` / `5` | `0x0101` (echoed at once on an accepted load) |
+| Refused load (cable out) | settles at `4` | `0x0100` -> `0`, no `0x0101` echo |
+| Auto load | `0x23` | `0x2003` |
+| Auto load finished (`0x53C7`) | `14` | `15` |
+
+The cable-out bypass (`0x53C9` = `2` while auto load waits) is the same.

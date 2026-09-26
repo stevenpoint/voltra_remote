@@ -314,11 +314,35 @@ bool parse_rep_telemetry(const Packet &pkt, RepTelemetry &out)
 {
     if (pkt.cmd != CMD_TELEMETRY || pkt.payload_len < 6) return false;
     const uint8_t *p = pkt.payload;
-    if (p[0] != 0x81 || p[1] != 0x2B) return false;
+    // 81 2B from a single unit; a twinned host sends a longer 81 42 frame that starts
+    // the same way (captured).
+    if (p[0] != 0x81 || (p[1] != 0x2B && p[1] != 0x42)) return false;
     out.phase = p[2];
     out.set_count = p[3];
     out.rep_count = (uint16_t)((p[4] << 8) | p[5]);   // big-endian
     if (out.rep_count > 10000) return false;
+    return true;
+}
+
+bool parse_twin_status(const Packet &pkt, TwinStatus &out)
+{
+    if (pkt.cmd != CMD_TWIN_STATUS) return false;
+    const uint8_t *p = pkt.payload;
+    const size_t n = pkt.payload_len;
+    // `BB 01 SS ...`: BB is the unit's battery % (0x39 at 57 %, 0x35 at 53 %), so it
+    // cannot be matched on. A reply to a request has a leading 00 status byte; a push
+    // does not (23 vs 22 bytes). A battery byte is never 0, so a leading 0 not followed by
+    // 01 is status too, which also covers truncated replies.
+    const size_t k = (n >= 2 && p[0] == 0x00 && (p[1] != 0x01 || n == 23)) ? 1 : 0;
+    if (n < k + 3 || p[k + 1] != 0x01) return false;
+    out = TwinStatus();
+    out.state = p[k + 2];
+    if (n >= k + 15) {
+        memcpy(out.own, p + k + 3, 6);
+        memcpy(out.peer, p + k + 9, 6);
+        out.has_addrs = true;
+    }
+    if (n >= k + 16 && p[k + 15] > 0 && p[k + 15] <= 100) out.peer_battery = p[k + 15];
     return true;
 }
 

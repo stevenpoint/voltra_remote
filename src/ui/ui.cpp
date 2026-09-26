@@ -4,10 +4,13 @@
 #include <Preferences.h>
 #include <lvgl.h>
 
+#include "esp_heap_caps.h"
+
 #include <algorithm>
 #include <vector>
 
 #include "hw/battery.h"
+#include "hw/display.h"
 #include "hw/haptics.h"
 #include "hw/knob.h"
 #include "ui/knob_step.h"
@@ -49,6 +52,9 @@ namespace {
 #define ICON_INVERSE   "\xEE\x80\x82"   // U+E002
 #define ICON_MOUNTAIN  "\xEE\x80\x83"   // U+E003
 #define ICON_SETTINGS  "\xEE\x80\x84"   // U+E004
+#define ICON_ATTACH    "\xEE\x80\x85"   // U+E005
+#define C_ATTACH   lv_color_hex(0x38bdf8)
+#define C_ATTACH_HEX "38bdf8"
 
 // Knob stepping (fine/coarse selection and snapping) lives in ui/knob_step.h.
 using knobstep::apply_step;
@@ -60,9 +66,14 @@ constexpr uint32_t EDIT_HOLD_MS = 900;
 // through its intermediate state, so the screen says "LOADING..." rather than
 // flicking back to unloaded mid-sequence.
 constexpr uint32_t TOGGLE_PENDING_MS = 5000;
+constexpr uint32_t LOAD_REFUSED_SHOW_MS = 10000;   // how long a tap means "override"
 constexpr uint32_t AUTO_LOAD_PENDING_MS = 4000;
+// Switch off after this long with no touch or knob input, unless the Voltra is loaded.
+constexpr uint32_t POWER_OFF_IDLE_MS = 10 * 60 * 1000;
+// Attachment (bar, handle...) weight added to the displayed weight, never sent to the Voltra.
+constexpr int MAX_ATTACH_LB = 50;
 
-enum class Screen { Main, Settings, AdjustChains, AdjustEcc, Connect };
+enum class Screen { Main, Settings, AdjustChains, AdjustEcc, AdjustAttach, Connect };
 
 /**
  * Chains, inverse chains and mountain are one accessory in three styles: the Voltra
@@ -77,6 +88,7 @@ enum SettingsRow : intptr_t {
     ROW_INVERSE,
     ROW_ECCENTRIC,
     ROW_MOUNTAIN,
+    ROW_ATTACH,
     ROW_CLOSE,
 };
 
@@ -106,8 +118,10 @@ struct Ui {
         lv_obj_t *icon = nullptr;
         lv_obj_t *primary = nullptr;     // in the unit the Voltra is set to show first
         lv_obj_t *secondary = nullptr;   // the other unit, muted
+        lv_obj_t *arc = nullptr;         // watch: a small dial showing the amount
     };
-    Chip chip_ecc, chip_chain;
+    Chip chip_ecc, chip_chain, chip_attach;
+    lv_obj_t *dock = nullptr;   // watch: the row of chips and the settings button
 
     // Two weight presets either side of the weight, kept on the knob only (NVS).
     struct Preset {
@@ -118,6 +132,8 @@ struct Ui {
     };
     Preset presets[2];
     lv_obj_t *lbl_kbat = nullptr;
+    // Covers the whole main screen while loaded, so a tap anywhere unloads.
+    lv_obj_t *unload_catcher = nullptr;
 
     // settings menu: one bubble per accessory
     lv_obj_t *scr_settings = nullptr;
@@ -127,8 +143,15 @@ struct Ui {
         lv_obj_t *title = nullptr;
         lv_obj_t *value = nullptr;
     };
-    Bubble bub_ecc, bub_chains, bub_mountain, bub_inverse;
+    Bubble bub_ecc, bub_chains, bub_mountain, bub_inverse, bub_attach;
     lv_obj_t *btn_settings_done = nullptr;
+
+    // eccentric / chains / attachment (watch): the amount, a slider and quick picks
+    lv_obj_t *scr_value = nullptr;
+    lv_obj_t *lbl_val_title = nullptr;
+    lv_obj_t *lbl_val_num = nullptr, *lbl_val_unit = nullptr, *lbl_val_info = nullptr;
+    lv_obj_t *dial_val = nullptr;
+    lv_obj_t *val_pick[4] = {};
 
     // adjust
     lv_obj_t *scr_adjust = nullptr;
@@ -156,6 +179,7 @@ struct Ui {
     // base weight, or pounds.
     int chains = 0;            // shared by chains, inverse chains and mountain
     int ecc = 0;
+    int attach = 0;            // attachment lb, kept on this device only (NVS)
     int last_display = -2;     // Voltra lb/% setting the values above were taken in
     ChainStyle style = ChainStyle::Chains;       // what the amount currently drives
     ChainStyle adj_style = ChainStyle::Chains;   // which style the dial screen edits
@@ -167,14 +191,27 @@ struct Ui {
     bool toggle_target_loaded = false;
     // Auto load was just requested: show it until the Voltra reports its own progress.
     uint32_t auto_load_pending_until = 0;
+    // The Voltra refused a tap-to-load (cable out). Until then, a tap sends the
+    // override (Client::loadOverride()) instead of a plain load.
+    uint32_t load_refused_until = 0;
+    uint32_t last_load_refused = 0;
     // A set is under way: loaded and the cable has moved since the last rest.
     bool set_active = false;
+    // The Voltra adds eccentric only once it knows the rep's length, which it learns from
+    // the first full rep after loading. Set once a return has finished while loaded.
+    bool ecc_learned = false;
+    uint8_t last_rep_phase = 0;
+    uint8_t shown_phase = 0;   // rep phase on screen: 1 pull, 3 return, held through the others
 
     knobstep::RateTracker knob_rate;
 
     uint32_t last_state_version = 0xFFFFFFFF;
     uint32_t last_dev_version = 0xFFFFFFFF;
     uint32_t last_kbat_ms = 0;
+    uint32_t last_input_ms = 0;   // last knob turn or swipe (touches are LVGL's own count)
+    // Stand-in Voltra state for screenshots (ui_command "demo"), used in place of the real one.
+    bool demo = false;
+    DeviceState demo_st;
     DeviceState st;
     std::vector<FoundDevice> devs;
 } ui;
@@ -222,6 +259,12 @@ void format_amount(char *buf, size_t n, int v, bool signed_value)
 /** Fill a chip's two value lines: the Voltra's unit on top, the other below. */
 void set_chip_values(Ui::Chip &c, int v, bool signed_value)
 {
+#ifdef WATCH206
+    // One line: the amount in the Voltra's unit, pounds without the unit.
+    if (lb_mode()) lv_label_set_text_fmt(c.primary, signed_value ? "%+d" : "%d", v);
+    else lv_label_set_text_fmt(c.primary, signed_value ? "%+d%%" : "%d%%", v);
+    return;
+#endif
     char p[12], lb[12];
     snprintf(p, sizeof(p), signed_value ? "%+d%%" : "%d%%", amount_pct(v));
     snprintf(lb, sizeof(lb), signed_value ? "%+d lb" : "%d lb", amount_lb(v));
@@ -251,14 +294,28 @@ ChainStyle device_style(const DeviceState &st)
     return ChainStyle::Chains;
 }
 
+lv_obj_t *screen_obj(Screen s)
+{
+    switch (s) {
+        case Screen::Settings: return ui.scr_settings;
+#ifdef WATCH206
+        case Screen::AdjustChains:
+        case Screen::AdjustEcc:
+        case Screen::AdjustAttach: return ui.scr_value;
+#else
+        case Screen::AdjustChains:
+        case Screen::AdjustEcc:
+        case Screen::AdjustAttach: return ui.scr_adjust;
+#endif
+        case Screen::Connect: return ui.scr_connect;
+        default: return ui.scr_main;
+    }
+}
+
 void show(Screen s)
 {
     ui.screen = s;
-    lv_obj_t *scr = ui.scr_main;
-    if (s == Screen::Settings) scr = ui.scr_settings;
-    if (s == Screen::AdjustChains || s == Screen::AdjustEcc) scr = ui.scr_adjust;
-    if (s == Screen::Connect) scr = ui.scr_connect;
-    lv_scr_load_anim(scr, LV_SCR_LOAD_ANIM_FADE_IN, 120, 0, false);
+    lv_scr_load_anim(screen_obj(s), LV_SCR_LOAD_ANIM_FADE_IN, 120, 0, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -284,22 +341,192 @@ lv_obj_t *make_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color, 
     return l;
 }
 
-lv_obj_t *make_ring(lv_obj_t *parent, lv_color_t color)
+/** A 270-degree dial, open at the bottom, that only shows a value (not touchable). */
+lv_obj_t *make_dial(lv_obj_t *parent, int size, int width, lv_color_t color)
 {
     lv_obj_t *arc = lv_arc_create(parent);
     lv_obj_remove_style(arc, nullptr, LV_PART_KNOB);
     lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_size(arc, 344, 344);
+    lv_obj_set_size(arc, size, size);
     lv_obj_center(arc);
     lv_arc_set_bg_angles(arc, 135, 405);
     lv_arc_set_rotation(arc, 0);
-    lv_obj_set_style_arc_width(arc, 14, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(arc, 14, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(arc, width, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, width, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(arc, C_TRACK, LV_PART_MAIN);
     lv_obj_set_style_arc_color(arc, color, LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(arc, true, LV_PART_MAIN);
     lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
     return arc;
+}
+
+[[maybe_unused]] lv_obj_t *make_ring(lv_obj_t *parent, lv_color_t color) { return make_dial(parent, 344, 14, color); }
+
+#ifdef WATCH206
+// ---------------------------------------------------------------------------
+// Rail (watch): in place of the round ring, a thick line follows the screen's rounded
+// edge from low on the left side, over the top, to low on the right side. It fills up
+// to the weight, and a short white bar across it marks the weight itself.
+// ---------------------------------------------------------------------------
+constexpr float RAIL_INSET = 12;         // centre line from the screen edge
+constexpr float RAIL_RADIUS = 94;        // centre-line radius at the top corners
+constexpr float RAIL_BOTTOM_GAP = 110;   // where the ends stop, clear of the rounded bottom corners
+constexpr int RAIL_WIDTH = 12;
+constexpr int RAIL_MARK_LEN = 22, RAIL_MARK_WIDTH = 6;
+#define C_RAIL_TRACK lv_color_hex(0x5f6b80)
+
+struct RailState {
+    int lo = voltra::MIN_TARGET_LB;
+    int hi = voltra::MAX_TARGET_LB;
+    int value = voltra::MIN_TARGET_LB;
+    lv_color_t color = C_RAIL_TRACK;
+} s_rail;
+
+/** Left side (upwards), top-left corner, top, top-right corner, right side (downwards). */
+struct RailGeom {
+    float x0, x1, y_top, y_bot, r;
+    float side, quarter, top, total;
+};
+
+RailGeom rail_geom(float w, float h)
+{
+    RailGeom g;
+    g.r = RAIL_RADIUS;
+    g.x0 = RAIL_INSET;
+    g.x1 = w - RAIL_INSET;
+    g.y_top = RAIL_INSET;
+    g.y_bot = h - RAIL_BOTTOM_GAP;
+    g.side = g.y_bot - (g.y_top + g.r);
+    g.quarter = (float)M_PI * g.r / 2;
+    g.top = (g.x1 - g.x0) - 2 * g.r;
+    g.total = 2 * g.side + 2 * g.quarter + g.top;
+    return g;
+}
+
+/** Point at distance s along the rail, with the unit normal across it. */
+void rail_point(const RailGeom &g, float s, float &x, float &y, float &nx, float &ny)
+{
+    if (s < g.side) { x = g.x0; y = g.y_bot - s; nx = 1; ny = 0; return; }
+    s -= g.side;
+    if (s < g.quarter) {
+        const float a = (float)M_PI + s / g.r;
+        nx = cosf(a); ny = sinf(a);
+        x = g.x0 + g.r + g.r * nx; y = g.y_top + g.r + g.r * ny;
+        return;
+    }
+    s -= g.quarter;
+    if (s < g.top) { x = g.x0 + g.r + s; y = g.y_top; nx = 0; ny = 1; return; }
+    s -= g.top;
+    if (s < g.quarter) {
+        const float a = 1.5f * (float)M_PI + s / g.r;
+        nx = cosf(a); ny = sinf(a);
+        x = g.x1 - g.r + g.r * nx; y = g.y_top + g.r + g.r * ny;
+        return;
+    }
+    s -= g.quarter;
+    x = g.x1; y = g.y_top + g.r + std::min(s, g.side); nx = -1; ny = 0;
+}
+
+/** Draw the stretch [a, b] of the rail, with square ends. */
+void rail_stroke(lv_draw_ctx_t *ctx, const lv_area_t &area, const RailGeom &g, float a, float b,
+                 lv_color_t color)
+{
+    lv_draw_line_dsc_t line;
+    lv_draw_line_dsc_init(&line);
+    line.width = RAIL_WIDTH;
+    line.color = color;
+    lv_draw_arc_dsc_t arc;
+    lv_draw_arc_dsc_init(&arc);
+    arc.width = RAIL_WIDTH;
+    arc.color = color;
+    arc.rounded = 0;
+    const lv_coord_t ox = area.x1, oy = area.y1;
+    auto straight = [&](float x1, float y1, float x2, float y2) {
+        lv_point_t p1 = {(lv_coord_t)(ox + lroundf(x1)), (lv_coord_t)(oy + lroundf(y1))};
+        lv_point_t p2 = {(lv_coord_t)(ox + lroundf(x2)), (lv_coord_t)(oy + lroundf(y2))};
+        lv_draw_line(ctx, &line, &p1, &p2);
+    };
+    auto corner = [&](float cx, float cy, float deg0, float deg1) {
+        lv_point_t c = {(lv_coord_t)(ox + lroundf(cx)), (lv_coord_t)(oy + lroundf(cy))};
+        lv_draw_arc(ctx, &arc, &c, (uint16_t)lroundf(g.r + RAIL_WIDTH / 2.0f), (uint16_t)lroundf(deg0),
+                    (uint16_t)lroundf(deg1));
+    };
+    float s0 = 0;
+    // Each piece gets the part of [a, b] that falls on it, as offsets p..q into the piece.
+    auto piece = [&](float len, int kind) {
+        const float p = std::max(a, s0) - s0, q = std::min(b, s0 + len) - s0;
+        s0 += len;
+        if (q <= p) return;
+        switch (kind) {
+            case 0: straight(g.x0, g.y_bot - p, g.x0, g.y_bot - q); break;
+            case 1: corner(g.x0 + g.r, g.y_top + g.r, 180 + 90 * p / len, 180 + 90 * q / len); break;
+            case 2: straight(g.x0 + g.r + p, g.y_top, g.x0 + g.r + q, g.y_top); break;
+            case 3: corner(g.x1 - g.r, g.y_top + g.r, 270 + 90 * p / len, 270 + 90 * q / len); break;
+            default: straight(g.x1, g.y_top + g.r + p, g.x1, g.y_top + g.r + q); break;
+        }
+    };
+    piece(g.side, 0);
+    piece(g.quarter, 1);
+    piece(g.top, 2);
+    piece(g.quarter, 3);
+    piece(g.side, 4);
+}
+
+void rail_draw(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    lv_draw_ctx_t *ctx = lv_event_get_draw_ctx(e);
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const RailGeom g = rail_geom(lv_area_get_width(&a), lv_area_get_height(&a));
+    const int span = s_rail.hi > s_rail.lo ? s_rail.hi - s_rail.lo : 1;
+    const float s = g.total * (s_rail.value - s_rail.lo) / span;
+
+    rail_stroke(ctx, a, g, s, g.total, C_RAIL_TRACK);
+    rail_stroke(ctx, a, g, 0, s, s_rail.color);
+
+    float x, y, nx, ny;
+    rail_point(g, s, x, y, nx, ny);
+    lv_draw_line_dsc_t mark;
+    lv_draw_line_dsc_init(&mark);
+    mark.width = RAIL_MARK_WIDTH;
+    mark.color = C_TEXT;
+    const float h = RAIL_MARK_LEN / 2.0f;
+    lv_point_t p1 = {(lv_coord_t)(a.x1 + lroundf(x - nx * h)), (lv_coord_t)(a.y1 + lroundf(y - ny * h))};
+    lv_point_t p2 = {(lv_coord_t)(a.x1 + lroundf(x + nx * h)), (lv_coord_t)(a.y1 + lroundf(y + ny * h))};
+    lv_draw_line(ctx, &mark, &p1, &p2);
+}
+
+lv_obj_t *make_rail(lv_obj_t *parent)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, LV_PCT(100), LV_PCT(100));
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(o, rail_draw, LV_EVENT_DRAW_MAIN, nullptr);
+    return o;
+}
+#endif
+
+/** Weight gauge: the rail on the watch, the ring on the knob. */
+void set_weight_gauge(lv_obj_t *gauge, int lo, int hi, int value, lv_color_t color)
+{
+#ifdef WATCH206
+    value = value < lo ? lo : (value > hi ? hi : value);
+    if (s_rail.lo == lo && s_rail.hi == hi && s_rail.value == value &&
+        lv_color_to32(s_rail.color) == lv_color_to32(color)) {
+        return;
+    }
+    s_rail.lo = lo;
+    s_rail.hi = hi;
+    s_rail.value = value;
+    s_rail.color = color;
+    lv_obj_invalidate(gauge);
+#else
+    lv_arc_set_range(gauge, lo, hi);
+    lv_arc_set_value(gauge, value);
+    lv_obj_set_style_arc_color(gauge, color, LV_PART_INDICATOR);
+#endif
 }
 
 lv_obj_t *make_flat_button(lv_obj_t *parent, int w, int h)
@@ -339,7 +566,7 @@ lv_obj_t *make_pill_button(lv_obj_t *parent, int w, int h, lv_color_t border, co
  * The Done / Close button of a sub-screen, in the gap at the bottom of the ring. Sized
  * for a thumb: the whole pill is the touch target, plus a margin around it.
  */
-lv_obj_t *make_action_button(lv_obj_t *parent, const char *text)
+[[maybe_unused]] lv_obj_t *make_action_button(lv_obj_t *parent, const char *text)
 {
     lv_obj_t *label = nullptr;
     lv_obj_t *b = make_pill_button(parent, 140, 46, C_MUTED, text, &label);
@@ -442,6 +669,52 @@ void flush_pending(uint32_t now)
     }
 }
 
+/** The amount the adjust screen on show edits: eccentric, the chain style's, or attachment. */
+int adjust_value()
+{
+    switch (ui.screen) {
+        case Screen::AdjustChains: return style_amount(ui.adj_style);
+        case Screen::AdjustEcc: return ui.ecc;
+        case Screen::AdjustAttach: return ui.attach;
+        default: return 0;
+    }
+}
+
+/** Set that amount, within its limits. @return false if it did not change. */
+bool set_adjust_value(int v)
+{
+    switch (ui.screen) {
+        case Screen::AdjustChains: {
+            v = clampi(v, 0, chains_max());
+            if (v == style_amount(ui.adj_style)) return false;
+            // Dialling an amount into another style switches the Voltra over to it,
+            // which turns the previous style off.
+            if (v > 0 && ui.style != ui.adj_style) {
+                ui.style = ui.adj_style;
+                ui.style_dirty = true;
+            }
+            ui.chains = v;
+            mark_chains_changed();
+            return true;
+        }
+        case Screen::AdjustEcc: {
+            const int m = ecc_max();
+            v = clampi(v, -m, m);
+            if (v == ui.ecc) return false;
+            ui.ecc = v;
+            mark_ecc_changed();
+            return true;
+        }
+        case Screen::AdjustAttach:
+            v = clampi(v, 0, MAX_ATTACH_LB);
+            if (v == ui.attach) return false;
+            ui.attach = v;
+            return true;
+        default:
+            return false;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main screen
 // ---------------------------------------------------------------------------
@@ -490,11 +763,29 @@ void refresh_main();
 constexpr const char *PRESET_NS = "knob";
 const char *const PRESET_KEYS[2] = {"preset0", "preset1"};
 
-void load_presets()
+[[maybe_unused]] void load_presets()
 {
     Preferences p;
     if (!p.begin(PRESET_NS, true)) return;   // namespace not created yet: all empty
     for (int i = 0; i < 2; i++) ui.presets[i].lb = p.getUShort(PRESET_KEYS[i], 0);
+    p.end();
+}
+
+constexpr const char *ATTACH_KEY = "attach";
+
+void load_attach()
+{
+    Preferences p;
+    if (!p.begin(PRESET_NS, true)) return;
+    ui.attach = clampi(p.getUChar(ATTACH_KEY, 0), 0, MAX_ATTACH_LB);
+    p.end();
+}
+
+void save_attach()
+{
+    Preferences p;
+    if (!p.begin(PRESET_NS, false)) return;
+    if (p.getUChar(ATTACH_KEY, 0) != ui.attach) p.putUChar(ATTACH_KEY, (uint8_t)ui.attach);
     p.end();
 }
 
@@ -510,6 +801,7 @@ void save_preset(int i)
 void refresh_presets()
 {
     for (auto &pr : ui.presets) {
+        if (!pr.btn) continue;   // not built (watch)
         if (pr.lb > 0) {
             lv_label_set_text_fmt(pr.value, "%d", pr.lb);
             lv_obj_set_style_text_color(pr.value, C_TEXT, 0);
@@ -550,7 +842,7 @@ void on_preset_hold(lv_event_t *e)
     refresh_presets();
 }
 
-void make_preset(int i, int x, int y)
+[[maybe_unused]] void make_preset(int i, int x, int y)
 {
     auto &pr = ui.presets[i];
     pr.btn = make_pill_button(ui.scr_main, 56, 56, C_TRACK, "", nullptr);
@@ -567,6 +859,42 @@ void make_preset(int i, int x, int y)
     lv_obj_align(pr.unit, LV_ALIGN_CENTER, 0, 13);
 }
 
+// Main screen layout, as offsets from the screen centre.
+#ifdef WATCH206
+// 410x502, inside the rail: the tap-to-load line at the top of the weight's touch target,
+// the weight, a line under it (what makes up the weight, or the rep phase), and the dock
+// of chips at the bottom, where the set and rep counts go during a set.
+#define L_WEIGHT_FONT font_poppins_160
+#define L_STATE_FONT font_poppins_20
+#define L_REPS_FONT font_poppins_16
+#define L_IDLE_NUM lv_color_hex(0xe2e8f0)   // unloaded: light enough to read
+#define L_IDLE_GAUGE C_TEXT
+#define L_OFF_GAUGE C_RAIL_TRACK
+constexpr const char *L_WEIGHT_UNIT = "lb";
+constexpr const char *L_TXT_LOAD = "TAP TO LOAD";
+constexpr const char *L_TXT_UNLOAD = "TAP TO UNLOAD";
+constexpr int L_CENTER_W = 330, L_CENTER_H = 254, L_CENTER_Y = -54;
+constexpr int L_ROW_Y = 22;       // weight row, from the centre of its touch target
+constexpr int L_REPS_Y = 52;
+constexpr int L_DOCK_Y = 151;
+constexpr int L_COUNT_X = 77, L_COUNT_CAP_Y = 104, L_COUNT_NUM_Y = 152;
+#else
+#define L_WEIGHT_FONT font_poppins_96
+#define L_STATE_FONT font_poppins_14
+#define L_REPS_FONT font_poppins_14
+#define L_IDLE_NUM C_IDLE_NUM
+#define L_IDLE_GAUGE C_IDLE_RING
+#define L_OFF_GAUGE C_TRACK
+constexpr const char *L_WEIGHT_UNIT = "lb";
+constexpr const char *L_TXT_LOAD = "Tap to Load";
+constexpr const char *L_TXT_UNLOAD = "Tap to Unload";
+constexpr int L_CENTER_W = 236, L_CENTER_H = 150, L_CENTER_Y = -34;
+constexpr int L_ROW_Y = 0;
+constexpr int L_REPS_Y = 50;
+constexpr int L_GEAR_Y = 114;
+constexpr int L_CHIP_X = 74, L_CHIP_Y = 96;
+#endif
+
 void refresh_main()
 {
     const DeviceState &st = ui.st;
@@ -574,20 +902,26 @@ void refresh_main()
     bool ready = st.conn == ConnState::Ready;
     uint32_t now = millis();
 
-    // ring + weight
-    lv_arc_set_range(ui.arc_weight, voltra::MIN_TARGET_LB, weight_max());
-    lv_arc_set_value(ui.arc_weight, ui.weight);
-    if (connected) {
-        lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight);
-    } else {
-        lv_label_set_text_fmt(ui.lbl_weight, "%d", ui.weight);
-    }
-
     bool loaded = st.loaded();
     bool pending = now < ui.toggle_pending_until && loaded != ui.toggle_target_loaded;
-    lv_color_t ring = loaded ? C_LOADED : C_IDLE_RING;
-    if (!connected) ring = C_TRACK;
-    lv_obj_set_style_arc_color(ui.arc_weight, ring, LV_PART_INDICATOR);
+    // During a set the bubbles give way to big set / rep counters.
+    const bool set_mode = ready && loaded && ui.set_active;
+    // With eccentric on, the Voltra adds it on the way back (the return phase of each
+    // rep), so the weight follows the rep: base on the pull, base + eccentric on return.
+    // Not on the first rep after loading, which the Voltra uses to learn the rep length.
+    const bool ecc_phase = set_mode && ui.ecc != 0 && ui.ecc_learned && st.rep_phase == 3;
+
+    // weight
+    // The Voltra's weight is per unit; twinned, show the pair's total like its screen does.
+    const int per_unit_x = st.twinned() ? 2 : 1;
+    const int device_lb = (ui.weight + (ecc_phase ? amount_lb(ui.ecc) : 0)) * per_unit_x;
+    // The attachment's weight is added for display only.
+    lv_label_set_text_fmt(ui.lbl_weight, "%d", device_lb + ui.attach);
+
+    lv_color_t ring = loaded ? C_LOADED : L_IDLE_GAUGE;
+    if (!connected) ring = L_OFF_GAUGE;
+    set_weight_gauge(ui.arc_weight, voltra::MIN_TARGET_LB * per_unit_x, weight_max() * per_unit_x,
+                     device_lb, ring);
 
     const bool auto_loading = connected && (st.auto_loading() || now < ui.auto_load_pending_until);
     if (!connected) {
@@ -601,13 +935,19 @@ void refresh_main()
         if (ms > 0 && ms <= 3000) lv_label_set_text_fmt(ui.lbl_state, "LOADING IN %d", (ms + 999) / 1000);
         else lv_label_set_text(ui.lbl_state, "PULL & HOLD CABLE");
         lv_obj_set_style_text_color(ui.lbl_state, C_WARN, 0);
-        lv_obj_set_style_text_color(ui.lbl_weight, C_IDLE_NUM, 0);
+        lv_obj_set_style_text_color(ui.lbl_weight, L_IDLE_NUM, 0);
+    } else if (!loaded && now < ui.load_refused_until) {
+        // Tap-to-load refused because the cable is out. A tap now overrides and loads
+        // at once; hold still starts the Voltra's auto load.
+        lv_label_set_text(ui.lbl_state, "CABLE OUT: TAP TO OVERRIDE");
+        lv_obj_set_style_text_color(ui.lbl_state, C_WARN, 0);
+        lv_obj_set_style_text_color(ui.lbl_weight, L_IDLE_NUM, 0);
     } else if (pending) {
         lv_label_set_text(ui.lbl_state, ui.toggle_target_loaded ? "LOADING..." : "UNLOADING...");
         lv_obj_set_style_text_color(ui.lbl_state, C_WARN, 0);
-        lv_obj_set_style_text_color(ui.lbl_weight, loaded ? C_LOADED : C_IDLE_NUM, 0);
+        lv_obj_set_style_text_color(ui.lbl_weight, loaded ? C_LOADED : L_IDLE_NUM, 0);
     } else if (loaded) {
-        lv_label_set_text(ui.lbl_state, "Tap to Unload");
+        lv_label_set_text(ui.lbl_state, L_TXT_UNLOAD);
         lv_obj_set_style_text_color(ui.lbl_state, C_TEXT, 0);
         lv_obj_set_style_text_color(ui.lbl_weight, C_LOADED, 0);
     } else if (!ready) {
@@ -617,31 +957,41 @@ void refresh_main()
     } else if (st.activation == 0) {
         lv_label_set_text(ui.lbl_state, "VOLTRA NOT ACTIVATED");
         lv_obj_set_style_text_color(ui.lbl_state, C_DANGER, 0);
-        lv_obj_set_style_text_color(ui.lbl_weight, C_IDLE_NUM, 0);
+        lv_obj_set_style_text_color(ui.lbl_weight, L_IDLE_NUM, 0);
     } else {
-        lv_label_set_text(ui.lbl_state, "Tap to Load");
+        lv_label_set_text(ui.lbl_state, L_TXT_LOAD);
         lv_obj_set_style_text_color(ui.lbl_state, C_TEXT, 0);
-        lv_obj_set_style_text_color(ui.lbl_weight, C_IDLE_NUM, 0);
+        lv_obj_set_style_text_color(ui.lbl_weight, L_IDLE_NUM, 0);
     }
 
     // top bar: Bluetooth icon (blue when connected, white when not) and, once connected,
     // the Voltra's battery level. Recolour markup colours just the icon.
-    char top[64];
+    char top[96];
     const char *bt_hex = connected ? C_BT_HEX : C_WHITE_HEX;
+    auto battery_sym = [](int pct) {
+        return pct > 80 ? LV_SYMBOL_BATTERY_FULL : pct > 60 ? LV_SYMBOL_BATTERY_3
+             : pct > 40 ? LV_SYMBOL_BATTERY_2 : pct > 15 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
+    };
     if (connected && st.battery >= 0) {
-        const char *sym = st.battery > 80 ? LV_SYMBOL_BATTERY_FULL
-                        : st.battery > 60 ? LV_SYMBOL_BATTERY_3
-                        : st.battery > 40 ? LV_SYMBOL_BATTERY_2
-                        : st.battery > 15 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
-        snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#   %s %d%%", bt_hex, sym, st.battery);
+        snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#   %s %d%%", bt_hex, battery_sym(st.battery),
+                 st.battery);
+        if (st.twinned() && st.twin_peer_battery >= 0) {
+            // Twinned: the follower's battery after the host's.
+            const size_t n = strlen(top);
+            snprintf(top + n, sizeof(top) - n, "  %s %d%%", battery_sym(st.twin_peer_battery),
+                     st.twin_peer_battery);
+        }
     } else {
         snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#", bt_hex);
+    }
+    if (connected && (st.twinned() || st.twin_state == voltra::TWIN_STATE_JOINING)) {
+        // Twin mode: this Voltra hosts, and every command drives the pair.
+        const size_t n = strlen(top);
+        snprintf(top + n, sizeof(top) - n, st.twinned() ? "   #%s TWIN#" : "   #%s TWINNING#", C_WHITE_HEX);
     }
     lv_label_set_text(ui.lbl_top, top);
     lv_obj_set_style_text_color(ui.lbl_top, C_TEXT, 0);
 
-    // During a set the bubbles give way to big set / rep counters.
-    const bool set_mode = ready && loaded && ui.set_active;
     lv_obj_t *const set_widgets[] = {ui.lbl_set_cap, ui.lbl_set_num, ui.lbl_rep_cap};
     for (lv_obj_t *o : set_widgets) {
         if (set_mode) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
@@ -656,17 +1006,35 @@ void refresh_main()
         lv_label_set_text_fmt(ui.lbl_rep_num, "%u", (unsigned)st.reps);
     }
 
-    // reps / live force (small line, outside a set)
+    // The line under the weight: during a set (watch) the rep phase, else reps or the live
+    // force between sets, else what the weight is made of.
+    if (!set_mode) ui.shown_phase = 0;
+    else if (st.rep_phase == 1 || st.rep_phase == 3) ui.shown_phase = st.rep_phase;   // else keep
     if (set_mode) {
-        lv_label_set_text(ui.lbl_reps, "");
-    } else if (ready && loaded) {
-        if (st.reps > 0 || st.sets > 0) {
-            lv_label_set_text_fmt(ui.lbl_reps, "SET %u   REP %u", (unsigned)st.sets, (unsigned)st.reps);
-        } else if (st.force_known) {
-            lv_label_set_text_fmt(ui.lbl_reps, "%d lb on cable", st.force_lb);
+#ifdef WATCH206
+        if (ui.shown_phase == 3 && ecc_phase) {
+            lv_label_set_text_fmt(ui.lbl_reps, LV_SYMBOL_DOWN "  Return    %+d eccentric",
+                                  amount_lb(ui.ecc) * per_unit_x);
+        } else if (ui.shown_phase == 3) {
+            lv_label_set_text(ui.lbl_reps, LV_SYMBOL_DOWN "  Return");
+        } else if (ui.shown_phase == 1) {
+            lv_label_set_text(ui.lbl_reps, LV_SYMBOL_UP "  Pull");
         } else {
             lv_label_set_text(ui.lbl_reps, "");
         }
+#else
+        lv_label_set_text(ui.lbl_reps, "");
+#endif
+    } else if (ready && loaded && (st.reps > 0 || st.sets > 0)) {
+        lv_label_set_text_fmt(ui.lbl_reps, "SET %u   REP %u", (unsigned)st.sets, (unsigned)st.reps);
+    } else if (ready && loaded && st.force_known) {
+        lv_label_set_text_fmt(ui.lbl_reps, "%d lb on cable", st.force_lb);
+    } else if (ui.attach > 0) {
+#ifdef WATCH206
+        lv_label_set_text_fmt(ui.lbl_reps, "%d Voltra  +  #" C_ATTACH_HEX " %d attachment#", device_lb, ui.attach);
+#else
+        lv_label_set_text_fmt(ui.lbl_reps, "Voltra %d lb  +  attachment %d lb", device_lb, ui.attach);
+#endif
     } else {
         lv_label_set_text(ui.lbl_reps, "");
     }
@@ -675,6 +1043,19 @@ void refresh_main()
     const bool any_accessory = ui.chains > 0 || ui.ecc != 0;
     lv_obj_set_style_text_color(ui.lbl_gear, any_accessory ? C_LOADED : C_TEXT, 0);
 
+#ifdef WATCH206
+    {
+        const int em = std::max(ecc_max(), 1), cm = std::max(chains_max(), 1);
+        lv_arc_set_mode(ui.chip_ecc.arc, LV_ARC_MODE_SYMMETRICAL);
+        lv_arc_set_range(ui.chip_ecc.arc, -em, em);
+        lv_arc_set_value(ui.chip_ecc.arc, ui.ecc);
+        lv_arc_set_range(ui.chip_chain.arc, 0, cm);
+        lv_arc_set_value(ui.chip_chain.arc, ui.chains);
+        lv_obj_set_style_arc_color(ui.chip_chain.arc, style_colour(ui.style), LV_PART_INDICATOR);
+        lv_arc_set_range(ui.chip_attach.arc, 0, MAX_ATTACH_LB);
+        lv_arc_set_value(ui.chip_attach.arc, ui.attach);
+    }
+#endif
     // eccentric chip (left)
     if (ui.ecc != 0) {
         set_chip_values(ui.chip_ecc, ui.ecc, true);
@@ -698,18 +1079,31 @@ void refresh_main()
         lv_obj_add_flag(ui.chip_chain.btn, LV_OBJ_FLAG_HIDDEN);
     }
 
+#ifdef WATCH206
+    // attachment chip
+    if (ui.attach > 0) {
+        lv_label_set_text_fmt(ui.chip_attach.primary, "%d", ui.attach);
+        lv_obj_clear_flag(ui.chip_attach.btn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(ui.chip_attach.btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (set_mode) lv_obj_add_flag(ui.chip_attach.btn, LV_OBJ_FLAG_HIDDEN);
+#endif
+
     refresh_presets();
 
     if (set_mode) {
         lv_obj_add_flag(ui.btn_gear, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ui.chip_ecc.btn, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ui.chip_chain.btn, LV_OBJ_FLAG_HIDDEN);
-        for (auto &pr : ui.presets) lv_obj_add_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
+        for (auto &pr : ui.presets) if (pr.btn) lv_obj_add_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(ui.btn_gear, LV_OBJ_FLAG_HIDDEN);
-        for (auto &pr : ui.presets) lv_obj_clear_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
+        for (auto &pr : ui.presets) if (pr.btn) lv_obj_clear_flag(pr.btn, LV_OBJ_FLAG_HIDDEN);
         // the chips were shown or hidden above according to the accessories
     }
+
+    set_obj_hidden(ui.unload_catcher, !(ready && loaded));
 }
 
 void on_center_clicked(lv_event_t *)
@@ -725,8 +1119,20 @@ void on_center_clicked(lv_event_t *)
         haptics_buzz();
         return;
     }
+    // A tap straight after a refused load (cable out) is the override.
+    const bool override = !ui.st.loaded() && millis() < ui.load_refused_until;
+    ui.load_refused_until = 0;
     // Push any pending dial edits first so the device loads the weight on screen.
     flush_pending(millis() + SEND_DEBOUNCE_MS);
+    if (override) {
+        // Runs through the Voltra's auto load, so show it as one.
+        c.loadOverride();
+        ui.toggle_pending_until = 0;
+        ui.auto_load_pending_until = millis() + AUTO_LOAD_PENDING_MS;
+        haptics_double();
+        refresh_main();
+        return;
+    }
     if (!ui.st.loaded() && (ui.st.auto_loading() || millis() < ui.auto_load_pending_until)) {
         // Tapping during auto load cancels it.
         ui.auto_load_pending_until = 0;
@@ -752,6 +1158,7 @@ void on_center_hold(lv_event_t *)
     }
     flush_pending(millis() + SEND_DEBOUNCE_MS);
     ui.toggle_pending_until = 0;
+    ui.load_refused_until = 0;
     ui.auto_load_pending_until = millis() + AUTO_LOAD_PENDING_MS;
     VClient::instance().autoLoad();
     haptics_double();
@@ -774,8 +1181,11 @@ void on_chip_clicked(lv_event_t *e)
 {
     haptics_click();
     ui.adj_return = Screen::Main;
-    if (lv_event_get_target(e) == ui.chip_ecc.btn) {
+    lv_obj_t *target = lv_event_get_target(e);
+    if (target == ui.chip_ecc.btn) {
         show(Screen::AdjustEcc);
+    } else if (target == ui.chip_attach.btn) {
+        show(Screen::AdjustAttach);
     } else {
         ui.adj_style = ui.style;
         show(Screen::AdjustChains);
@@ -783,29 +1193,59 @@ void on_chip_clicked(lv_event_t *e)
     refresh_adjust();
 }
 
-/** A small round button: an active accessory's icon over its amount in both units. */
-void make_chip(Ui::Chip &c, const char *icon, lv_color_t colour, int x, int y)
+/**
+ * A small round button for an active accessory: its icon over its amount, in both units
+ * on the knob and in the Voltra's unit on the watch. On the watch it sits in the dock
+ * (a row laid out for it), on the knob at (x, y) from the centre.
+ */
+void make_chip(Ui::Chip &c, const char *icon, lv_color_t colour, lv_obj_t *parent, int x, int y)
 {
-    c.btn = make_pill_button(ui.scr_main, 70, 70, colour, "", nullptr);
+#ifdef WATCH206
+    // A small version of the adjust screen's dial, the amount inside.
+    constexpr int size = 84;
+    c.btn = make_flat_button(parent, size, size);
+    c.arc = make_dial(c.btn, size, 6, colour);
+    c.icon = make_label(c.btn, &font_icons_26, colour, icon);
+    lv_obj_align(c.icon, LV_ALIGN_CENTER, 0, -12);
+    c.primary = make_label(c.btn, &font_poppins_20, C_TEXT, "");
+    lv_obj_align(c.primary, LV_ALIGN_CENTER, 0, 16);
+    c.secondary = make_label(c.btn, &font_poppins_14, C_MUTED, "");
+    lv_obj_add_flag(c.secondary, LV_OBJ_FLAG_HIDDEN);
+    (void)x;
+    (void)y;
+#else
+    constexpr int size = 70, row = 17;
+    c.btn = make_pill_button(parent, size, size, colour, "", nullptr);
     lv_obj_align(c.btn, LV_ALIGN_CENTER, x, y);
-    lv_obj_add_event_cb(c.btn, on_chip_clicked, LV_EVENT_CLICKED, nullptr);
     c.icon = make_label(c.btn, &font_icons_18, colour, icon);
-    lv_obj_align(c.icon, LV_ALIGN_CENTER, 0, -17);
+    lv_obj_align(c.icon, LV_ALIGN_CENTER, 0, -row);
     c.primary = make_label(c.btn, &font_poppins_14, C_TEXT, "");
     lv_obj_align(c.primary, LV_ALIGN_CENTER, 0, 1);
     c.secondary = make_label(c.btn, &font_poppins_14, C_MUTED, "");
-    lv_obj_align(c.secondary, LV_ALIGN_CENTER, 0, 17);
+    lv_obj_align(c.secondary, LV_ALIGN_CENTER, 0, row);
+#endif
+    lv_obj_add_event_cb(c.btn, on_chip_clicked, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_flag(c.btn, LV_OBJ_FLAG_HIDDEN);
 }
 
 void build_main()
 {
     ui.scr_main = make_screen();
+#ifdef WATCH206
+    ui.arc_weight = make_rail(ui.scr_main);
+    constexpr int TOP_BAR_Y = 34;   // below the edge scale's ticks
+#else
     ui.arc_weight = make_ring(ui.scr_main, C_IDLE_RING);
+    constexpr int TOP_BAR_Y = 20;
+#endif
 
     // top bar (tap -> connect menu)
+#ifdef WATCH206
+    ui.btn_top = make_flat_button(ui.scr_main, 300, 44);   // twinned it shows two batteries
+#else
     ui.btn_top = make_flat_button(ui.scr_main, 220, 44);
-    lv_obj_align(ui.btn_top, LV_ALIGN_TOP_MID, 0, 20);
+#endif
+    lv_obj_align(ui.btn_top, LV_ALIGN_TOP_MID, 0, TOP_BAR_Y);
     lv_obj_add_event_cb(ui.btn_top, on_top_clicked, LV_EVENT_CLICKED, nullptr);
     ui.lbl_top = make_label(ui.btn_top, &font_poppins_16, C_TEXT, "");
     lv_label_set_recolor(ui.lbl_top, true);
@@ -813,26 +1253,36 @@ void build_main()
     lv_obj_center(ui.lbl_top);
 
     // sets / reps sit under the weight
-    ui.lbl_reps = make_label(ui.scr_main, &font_poppins_14, C_MUTED, "");
-    lv_obj_align(ui.lbl_reps, LV_ALIGN_CENTER, 0, 50);
+    ui.lbl_reps = make_label(ui.scr_main, &L_REPS_FONT, C_MUTED, "");
+    lv_label_set_recolor(ui.lbl_reps, true);
+    lv_obj_align(ui.lbl_reps, LV_ALIGN_CENTER, 0, L_REPS_Y);
 
     // During a set: two big counters filling the space the bubbles use at rest.
+#ifdef WATCH206
+    // In the dock's place, under the weight, which stays where it is.
+    ui.lbl_set_cap = make_label(ui.scr_main, &font_poppins_16, C_MUTED, "SET");
+    ui.lbl_rep_cap = make_label(ui.scr_main, &font_poppins_16, C_MUTED, "REPS");
+    constexpr int cx = L_COUNT_X, cap_y = L_COUNT_CAP_Y, num_y = L_COUNT_NUM_Y;
+#else
     ui.lbl_set_cap = make_label(ui.scr_main, &font_poppins_22, C_MUTED, "Set");
     ui.lbl_rep_cap = make_label(ui.scr_main, &font_poppins_22, C_MUTED, "Reps");
+    // digits run from ~62 to ~108 px below centre, inside the ring
+    constexpr int cx = 64, cap_y = 38, num_y = 86;
+#endif
     ui.lbl_set_num = make_label(ui.scr_main, &font_poppins_bold_64, C_TEXT, "0");
     ui.lbl_rep_num = make_label(ui.scr_main, &font_poppins_bold_64, C_TEXT, "0");
     lv_obj_t *const caps[] = {ui.lbl_set_cap, ui.lbl_rep_cap};
-    lv_obj_align(ui.lbl_set_cap, LV_ALIGN_CENTER, -64, 38);
-    lv_obj_align(ui.lbl_rep_cap, LV_ALIGN_CENTER, 64, 38);
+    for (lv_obj_t *o : caps) lv_obj_set_style_text_letter_space(o, 2, 0);
+    lv_obj_align(ui.lbl_set_cap, LV_ALIGN_CENTER, -cx, cap_y);
+    lv_obj_align(ui.lbl_rep_cap, LV_ALIGN_CENTER, cx, cap_y);
     lv_obj_t *const nums[] = {ui.lbl_set_num, ui.lbl_rep_num};
     for (lv_obj_t *o : nums) {
         // centre the digits on their column however many there are
         lv_obj_set_width(o, 120);
         lv_obj_set_style_text_align(o, LV_TEXT_ALIGN_CENTER, 0);
     }
-    // digits run from ~62 to ~108 px below centre, inside the ring
-    lv_obj_align(ui.lbl_set_num, LV_ALIGN_CENTER, -64, 86);
-    lv_obj_align(ui.lbl_rep_num, LV_ALIGN_CENTER, 64, 86);
+    lv_obj_align(ui.lbl_set_num, LV_ALIGN_CENTER, -cx, num_y);
+    lv_obj_align(ui.lbl_rep_num, LV_ALIGN_CENTER, cx, num_y);
     for (lv_obj_t *o : caps) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
     for (lv_obj_t *o : nums) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
 
@@ -841,7 +1291,7 @@ void build_main()
     lv_obj_remove_style_all(ui.rep_dots);
     lv_obj_set_size(ui.rep_dots, 72, 14);
     lv_obj_clear_flag(ui.rep_dots, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(ui.rep_dots, LV_ALIGN_CENTER, 64, 100);
+    lv_obj_align(ui.rep_dots, LV_ALIGN_CENTER, cx, num_y + 14);
     for (int i = 0; i < 3; i++) {
         lv_obj_t *d = lv_obj_create(ui.rep_dots);
         lv_obj_remove_style_all(d);
@@ -856,47 +1306,97 @@ void build_main()
 
     // centre: weight, tap to load/unload
     // The weight's touch target also covers the tap-to-load line at its top.
-    ui.btn_center = make_flat_button(ui.scr_main, 236, 150);
-    lv_obj_align(ui.btn_center, LV_ALIGN_CENTER, 0, -34);
+    ui.btn_center = make_flat_button(ui.scr_main, L_CENTER_W, L_CENTER_H);
+    lv_obj_align(ui.btn_center, LV_ALIGN_CENTER, 0, L_CENTER_Y);
     // Short-clicked, not clicked, so releasing a hold (auto load) is not also a tap.
     lv_obj_add_event_cb(ui.btn_center, on_center_clicked, LV_EVENT_SHORT_CLICKED, nullptr);
     lv_obj_add_event_cb(ui.btn_center, on_center_hold, LV_EVENT_LONG_PRESSED, nullptr);
-    lv_obj_t *row = make_value_row(ui.btn_center, &font_poppins_96, &ui.lbl_weight, &ui.lbl_unit);
-    lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);   // 8 px higher on screen than before
-    ui.lbl_state = make_label(ui.btn_center, &font_poppins_14, C_MUTED, "NOT CONNECTED");
-    lv_obj_align(ui.lbl_state, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_t *row = make_value_row(ui.btn_center, &L_WEIGHT_FONT, &ui.lbl_weight, &ui.lbl_unit);
+    lv_label_set_text(ui.lbl_unit, L_WEIGHT_UNIT);
+    lv_obj_align(row, LV_ALIGN_CENTER, 0, L_ROW_Y);
+    ui.lbl_state = make_label(ui.btn_center, &L_STATE_FONT, C_MUTED, "NOT CONNECTED");
+#ifdef WATCH206
+    lv_obj_set_style_text_letter_space(ui.lbl_state, 2, 0);
+    lv_obj_align(ui.lbl_state, LV_ALIGN_TOP_MID, 0, 6);
 
+    // The dock: whichever chips are on, with the settings button, as one centred row.
+    // Settings sits between eccentric / chains and the attachment.
+    ui.dock = lv_obj_create(ui.scr_main);
+    lv_obj_remove_style_all(ui.dock);
+    lv_obj_set_size(ui.dock, 380, 92);
+    lv_obj_clear_flag(ui.dock, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(ui.dock, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ui.dock, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(ui.dock, 10, 0);
+    lv_obj_align(ui.dock, LV_ALIGN_CENTER, 0, L_DOCK_Y);
+    make_chip(ui.chip_ecc, ICON_ECCENTRIC, C_ECC, ui.dock, 0, 0);
+    make_chip(ui.chip_chain, ICON_CHAINS, C_CHAINS, ui.dock, 0, 0);
+    ui.btn_gear = make_pill_button(ui.dock, 72, 72, C_TRACK, "", nullptr);
+    make_chip(ui.chip_attach, ICON_ATTACH, C_ATTACH, ui.dock, 0, 0);
+#else
+    lv_obj_align(ui.lbl_state, LV_ALIGN_TOP_MID, 0, 4);
     ui.btn_gear = make_pill_button(ui.scr_main, 64, 64, C_TRACK, "", nullptr);
-    lv_obj_align(ui.btn_gear, LV_ALIGN_CENTER, 0, 114);
+    lv_obj_align(ui.btn_gear, LV_ALIGN_CENTER, 0, L_GEAR_Y);
+    // Chips for the active accessories, shown only while on. Kept inside the ring: the
+    // outer edge is ~156 px from centre against the ring's 158 px.
+    make_chip(ui.chip_ecc, ICON_ECCENTRIC, C_ECC, ui.scr_main, -L_CHIP_X, L_CHIP_Y);
+    make_chip(ui.chip_chain, ICON_CHAINS, C_CHAINS, ui.scr_main, L_CHIP_X, L_CHIP_Y);
+#endif
     lv_obj_add_event_cb(ui.btn_gear, on_gear_clicked, LV_EVENT_CLICKED, nullptr);
     ui.lbl_gear = make_label(ui.btn_gear, &font_icons_26, C_TEXT, ICON_SETTINGS);
     lv_obj_center(ui.lbl_gear);
 
-    // Chips for the active accessories, shown only while on. Kept inside the ring: the
-    // outer edge is ~156 px from centre against the ring's 158 px.
-    make_chip(ui.chip_ecc, ICON_ECCENTRIC, C_ECC, -74, 96);
-    make_chip(ui.chip_chain, ICON_CHAINS, C_CHAINS, 74, 96);
-
+#ifndef WATCH206
     // Weight presets at the sides, just below the weight's baseline. Outer edge ~151 px
-    // from centre against the ring's 158 px.
+    // from centre against the ring's 158 px. Not on the watch.
     load_presets();
     make_preset(0, -122, 30);
     make_preset(1, 122, 30);
     refresh_presets();
+#endif
 
     // knob battery (bottom, inside the gap at the bottom of the ring)
     ui.lbl_kbat = make_label(ui.scr_main, &font_poppins_14, C_MUTED, "");
     lv_obj_align(ui.lbl_kbat, LV_ALIGN_BOTTOM_MID, 0, -6);
+
+    // Created last so it sits above every other main-screen widget. Invisible; shown
+    // only while loaded, when a tap anywhere unloads.
+    ui.unload_catcher = lv_obj_create(ui.scr_main);
+    lv_obj_remove_style_all(ui.unload_catcher);
+    lv_obj_set_size(ui.unload_catcher, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(ui.unload_catcher, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(ui.unload_catcher, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ui.unload_catcher, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ui.unload_catcher, on_center_clicked, LV_EVENT_CLICKED, nullptr);
 }
 
 // ---------------------------------------------------------------------------
 // Adjust screen (chains / eccentric)
 // ---------------------------------------------------------------------------
+#ifdef WATCH206
+void refresh_value();
+#endif
+
 void refresh_adjust()
 {
+#ifdef WATCH206
+    refresh_value();
+    return;
+#endif
     bool chains = ui.screen == Screen::AdjustChains;
     lv_label_set_text(ui.lbl_adj_unit, accessory_unit());
-    if (chains) {
+    if (ui.screen == Screen::AdjustAttach) {
+        const int base = ui.weight * (ui.st.twinned() ? 2 : 1);
+        lv_label_set_text(ui.lbl_adj_unit, "lb");
+        lv_label_set_text(ui.lbl_adj_title, "Attachment");
+        lv_obj_set_style_text_color(ui.lbl_adj_title, C_ATTACH, 0);
+        lv_obj_set_style_arc_color(ui.arc_adj, C_ATTACH, LV_PART_INDICATOR);
+        lv_arc_set_mode(ui.arc_adj, LV_ARC_MODE_NORMAL);
+        lv_arc_set_range(ui.arc_adj, 0, MAX_ATTACH_LB);
+        lv_arc_set_value(ui.arc_adj, ui.attach);
+        lv_label_set_text_fmt(ui.lbl_adj_val, "%d", ui.attach);
+        lv_label_set_text_fmt(ui.lbl_adj_range, "%d lb Voltra  =  %d lb total", base, base + ui.attach);
+    } else if (chains) {
         int mx = chains_max();
         const int v = style_amount(ui.adj_style);
         const lv_color_t col = style_colour(ui.adj_style);
@@ -939,6 +1439,7 @@ void on_adjust_done(lv_event_t *)
 {
     haptics_click();
     flush_pending(millis() + SEND_DEBOUNCE_MS);
+    if (ui.screen == Screen::AdjustAttach) save_attach();
     show(ui.adj_return);
     if (ui.adj_return == Screen::Main) refresh_main();
     else refresh_settings();
@@ -951,6 +1452,7 @@ void on_gear_clicked(lv_event_t *)
     refresh_settings();
 }
 
+#ifndef WATCH206
 void build_adjust()
 {
     ui.scr_adjust = make_screen();
@@ -971,6 +1473,7 @@ void build_adjust()
     ui.btn_done = make_action_button(ui.scr_adjust, "DONE");
     lv_obj_add_event_cb(ui.btn_done, on_adjust_done, LV_EVENT_CLICKED, nullptr);
 }
+#endif
 
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1499,11 @@ void on_settings_row(lv_event_t *e)
             show(Screen::AdjustEcc);
             refresh_adjust();
             break;
+        case ROW_ATTACH:
+            ui.adj_return = Screen::Settings;
+            show(Screen::AdjustAttach);
+            refresh_adjust();
+            break;
         case ROW_CLOSE:
         default:
             show(Screen::Main);
@@ -1004,19 +1512,76 @@ void on_settings_row(lv_event_t *e)
     }
 }
 
+#ifdef WATCH206
+#define C_OFF lv_color_hex(0x64748b)
+
+/** Header of a watch sub-screen: a round back button, then the title beside it. */
+lv_obj_t *make_header(lv_obj_t *scr, const char *title, lv_color_t colour, lv_event_cb_t back_cb, intptr_t back_data)
+{
+    lv_obj_t *lbl = nullptr;
+    lv_obj_t *back = make_pill_button(scr, 44, 44, C_CARD, LV_SYMBOL_LEFT, &lbl);
+    lv_obj_set_style_border_width(back, 0, 0);
+    lv_obj_set_style_bg_color(back, C_TRACK, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(back, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_set_style_text_font(lbl, &font_poppins_20, 0);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 28, 30);
+    lv_obj_set_ext_click_area(back, 12);
+    lv_obj_set_user_data(back, (void *)back_data);
+    lv_obj_add_event_cb(back, back_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *t = make_label(scr, &font_poppins_22, colour, title);
+    lv_obj_align_to(t, back, LV_ALIGN_OUT_RIGHT_MID, 14, 1);
+    return t;
+}
+
+/** One row of the settings list: the accessory's icon and name, its value on the right. */
+void make_bubble(Ui::Bubble &b, lv_obj_t *list, const char *icon, lv_color_t colour, const char *title, intptr_t row)
+{
+    b.btn = lv_btn_create(list);
+    lv_obj_remove_style_all(b.btn);
+    lv_obj_set_size(b.btn, LV_PCT(100), 64);
+    lv_obj_set_style_radius(b.btn, 20, 0);
+    lv_obj_set_style_bg_color(b.btn, C_CARD, 0);
+    lv_obj_set_style_bg_opa(b.btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(b.btn, C_TRACK, LV_STATE_PRESSED);
+    lv_obj_add_flag(b.btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(b.btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_user_data(b.btn, (void *)row);
+    lv_obj_add_event_cb(b.btn, on_settings_row, LV_EVENT_CLICKED, nullptr);
+    b.icon = make_label(b.btn, &font_icons_26, colour, icon);
+    lv_obj_align(b.icon, LV_ALIGN_LEFT_MID, 18, 0);
+    b.title = make_label(b.btn, &font_poppins_18, C_TEXT, title);
+    lv_obj_align(b.title, LV_ALIGN_LEFT_MID, 60, 1);
+    b.value = make_label(b.btn, &font_poppins_18, C_OFF, "Off");
+    lv_obj_align(b.value, LV_ALIGN_RIGHT_MID, -18, 1);
+}
+
+/** On: tinted with the accessory's colour and the value in it. Off: plain, "Off" muted. */
+void set_bubble(Ui::Bubble &b, const char *value, bool active, lv_color_t colour)
+{
+    lv_label_set_text(b.value, value);
+    lv_obj_set_style_text_color(b.value, active ? colour : C_OFF, 0);
+    lv_obj_set_style_bg_color(b.btn, active ? colour : C_CARD, 0);
+    lv_obj_set_style_bg_opa(b.btn, active ? LV_OPA_20 : LV_OPA_COVER, 0);
+}
+constexpr const char *SETTING_OFF = "Off";
+#else
+constexpr const char *SETTING_OFF = "OFF";
+
 /** One round accessory button: the accessory's icon, a small title, and its current value. */
+constexpr int BUBBLE_SIZE = 88;
+
 void make_bubble(Ui::Bubble &b, const char *icon, const char *title, intptr_t row, int x, int y)
 {
-    b.btn = make_pill_button(ui.scr_settings, 96, 96, C_TRACK, "", nullptr);
+    b.btn = make_pill_button(ui.scr_settings, BUBBLE_SIZE, BUBBLE_SIZE, C_TRACK, "", nullptr);
     lv_obj_align(b.btn, LV_ALIGN_CENTER, x, y);
     lv_obj_set_user_data(b.btn, (void *)row);
     lv_obj_add_event_cb(b.btn, on_settings_row, LV_EVENT_CLICKED, nullptr);
     b.icon = make_label(b.btn, &font_icons_26, C_TEXT, icon);
-    lv_obj_align(b.icon, LV_ALIGN_CENTER, 0, -22);
+    lv_obj_align(b.icon, LV_ALIGN_CENTER, 0, -21);
     b.title = make_label(b.btn, &font_poppins_14, C_MUTED, title);
     lv_obj_align(b.title, LV_ALIGN_CENTER, 0, 1);
-    b.value = make_label(b.btn, &font_poppins_22, C_TEXT, "--");
-    lv_obj_align(b.value, LV_ALIGN_CENTER, 0, 22);
+    b.value = make_label(b.btn, &font_poppins_20, C_TEXT, "--");
+    lv_obj_align(b.value, LV_ALIGN_CENTER, 0, 21);
 }
 
 void set_bubble(Ui::Bubble &b, const char *value, bool active, lv_color_t colour)
@@ -1028,13 +1593,14 @@ void set_bubble(Ui::Bubble &b, const char *value, bool active, lv_color_t colour
     lv_obj_set_style_text_color(b.icon, active ? colour : C_TEXT, 0);
     lv_obj_set_style_text_color(b.title, active ? colour : C_MUTED, 0);
 }
+#endif
 
 void refresh_settings()
 {
     char buf[16];
 
     if (ui.ecc != 0) format_amount(buf, sizeof(buf), ui.ecc, true);
-    else snprintf(buf, sizeof(buf), "OFF");
+    else snprintf(buf, sizeof(buf), "%s", SETTING_OFF);
     set_bubble(ui.bub_ecc, buf, ui.ecc != 0, C_ECC);
 
     // one amount, three styles: only the live style's bubble shows it
@@ -1046,14 +1612,33 @@ void refresh_settings()
     for (const auto &cb : chain_bubbles) {
         const int v = style_amount(cb.s);
         if (v > 0) format_amount(buf, sizeof(buf), v, false);
-        else snprintf(buf, sizeof(buf), "OFF");
+        else snprintf(buf, sizeof(buf), "%s", SETTING_OFF);
         set_bubble(cb.b, buf, v > 0, style_colour(cb.s));
     }
+
+    if (ui.attach > 0) snprintf(buf, sizeof(buf), "%d lb", ui.attach);
+    else snprintf(buf, sizeof(buf), "%s", SETTING_OFF);
+    set_bubble(ui.bub_attach, buf, ui.attach > 0, C_ATTACH);
 }
 
 void build_settings()
 {
     ui.scr_settings = make_screen();
+#ifdef WATCH206
+    make_header(ui.scr_settings, "Settings", C_TEXT, on_settings_row, ROW_CLOSE);
+    lv_obj_t *list = lv_obj_create(ui.scr_settings);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, 366, LV_SIZE_CONTENT);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list, 8, 0);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 86);
+    make_bubble(ui.bub_attach,   list, ICON_ATTACH,    C_ATTACH, "Attachment",     ROW_ATTACH);
+    make_bubble(ui.bub_ecc,      list, ICON_ECCENTRIC, C_ECC,    "Eccentric",      ROW_ECCENTRIC);
+    make_bubble(ui.bub_chains,   list, ICON_CHAINS,    C_CHAINS, "Chains",         ROW_CHAINS);
+    make_bubble(ui.bub_inverse,  list, ICON_INVERSE,   C_CHAINS, "Inverse chains", ROW_INVERSE);
+    make_bubble(ui.bub_mountain, list, ICON_MOUNTAIN,  C_WARN,   "Mountain",       ROW_MOUNTAIN);
+#else
     lv_obj_t *ring = make_ring(ui.scr_settings, C_TRACK);
     lv_arc_set_value(ring, 0);
 
@@ -1061,28 +1646,180 @@ void build_settings()
     lv_obj_set_style_text_letter_space(title, 2, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
 
-    // 2x2 grid, in the order eccentric, chains / mountain, inverse chains. Kept inside the
-    // ring: the farthest bubble edge is ~126 px from centre against the ring's 158 px.
-    make_bubble(ui.bub_ecc,      ICON_ECCENTRIC, "Eccentric", ROW_ECCENTRIC, -52, -46);
-    make_bubble(ui.bub_chains,   ICON_CHAINS,    "Chains",    ROW_CHAINS,     52, -46);
-    make_bubble(ui.bub_mountain, ICON_MOUNTAIN,  "Mountain",  ROW_MOUNTAIN,  -52,  58);
-    make_bubble(ui.bub_inverse,  ICON_INVERSE,   "Inverse",   ROW_INVERSE,    52,  58);
+    // Three over two: eccentric, chains, inverse chains / mountain, attachment. Kept inside
+    // the ring: the farthest bubble edge is ~151 px from centre against the ring's 158 px.
+    make_bubble(ui.bub_ecc,      ICON_ECCENTRIC, "Eccentric",  ROW_ECCENTRIC, -96, -42);
+    make_bubble(ui.bub_chains,   ICON_CHAINS,    "Chains",     ROW_CHAINS,      0, -42);
+    make_bubble(ui.bub_inverse,  ICON_INVERSE,   "Inverse",    ROW_INVERSE,    96, -42);
+    make_bubble(ui.bub_mountain, ICON_MOUNTAIN,  "Mountain",   ROW_MOUNTAIN,  -48,  54);
+    make_bubble(ui.bub_attach,   ICON_ATTACH,    "Attachment", ROW_ATTACH,     48,  54);
 
     // Done sits in the gap at the bottom of the ring.
     ui.btn_settings_done = make_action_button(ui.scr_settings, "DONE");
     lv_obj_set_user_data(ui.btn_settings_done, (void *)(intptr_t)ROW_CLOSE);
     lv_obj_add_event_cb(ui.btn_settings_done, on_settings_row, LV_EVENT_CLICKED, nullptr);
+#endif
 }
+
+#ifdef WATCH206
+// ---------------------------------------------------------------------------
+// Adjust screen (watch): eccentric, chains (any style) or attachment. The amount inside
+// a dial showing it (swipe to change, as everywhere), and quick picks. Eccentric and
+// chains are in the Voltra's unit, pounds or percent.
+// ---------------------------------------------------------------------------
+
+void value_picks(int out[4])
+{
+    static const int attach[4] = {0, 10, 25, 50};
+    static const int ecc_lb[4] = {0, 5, 10, 20}, ecc_pct[4] = {0, 10, 20, 40};
+    static const int chains_lb[4] = {0, 10, 20, 30}, chains_pct[4] = {0, 25, 50, 100};
+    const int *p = ui.screen == Screen::AdjustAttach ? attach
+                 : ui.screen == Screen::AdjustEcc ? (lb_mode() ? ecc_lb : ecc_pct)
+                 : (lb_mode() ? chains_lb : chains_pct);
+    for (int i = 0; i < 4; i++) out[i] = p[i];
+}
+
+void refresh_value()
+{
+    const int v = adjust_value();
+    int lo = 0, hi = MAX_ATTACH_LB;
+    lv_color_t col = C_ATTACH;
+    const char *title = "Attachment";
+    const bool ecc = ui.screen == Screen::AdjustEcc;
+    char unit[4] = "lb";
+    if (ui.screen == Screen::AdjustAttach) {
+        const int base = ui.weight * (ui.st.twinned() ? 2 : 1);
+        lv_label_set_text_fmt(ui.lbl_val_info, "Total #" C_WHITE_HEX " %d lb#\nwith the Voltra's %d",
+                              base + v, base);
+    } else {
+        snprintf(unit, sizeof(unit), "%s", accessory_unit());
+        const int mx = ecc ? ecc_max() : chains_max();
+        hi = std::max(mx, STEP_COARSE_LB);
+        lo = ecc ? -hi : 0;
+        col = ecc ? C_ECC : style_colour(ui.adj_style);
+        title = ecc ? "Eccentric" : style_name(ui.adj_style);
+        // the other unit, and the limit
+        const char *fmt_lb = ecc ? "#" C_WHITE_HEX " %+d%%# of %d lb\nup to %d lb either way"
+                                 : "#" C_WHITE_HEX " %d%%# of %d lb\nup to %d lb";
+        const char *fmt_pct = ecc ? "#" C_WHITE_HEX " %+d lb# of %d lb\nup to %d%% either way"
+                                  : "#" C_WHITE_HEX " %d lb# of %d lb\nup to %d%%";
+        if (v == 0) {
+            lv_label_set_text_fmt(ui.lbl_val_info, ecc ? "Off\nup to %d%s either way" : "Off\nup to %d%s", mx,
+                                  lb_mode() ? " lb" : "%");
+        } else if (lb_mode()) {
+            lv_label_set_text_fmt(ui.lbl_val_info, fmt_lb, amount_pct(v), ui.weight, mx);
+        } else {
+            lv_label_set_text_fmt(ui.lbl_val_info, fmt_pct, pct_to_lb(v), ui.weight, mx);
+        }
+    }
+    lv_label_set_text(ui.lbl_val_title, title);
+    lv_obj_set_style_text_color(ui.lbl_val_title, col, 0);
+    lv_label_set_text_fmt(ui.lbl_val_num, ecc && v != 0 ? "%+d" : "%d", v);
+    lv_label_set_text(ui.lbl_val_unit, unit);
+
+    lv_arc_set_mode(ui.dial_val, ecc ? LV_ARC_MODE_SYMMETRICAL : LV_ARC_MODE_NORMAL);
+    lv_arc_set_range(ui.dial_val, lo, hi);
+    lv_arc_set_value(ui.dial_val, clampi(v, lo, hi));
+    lv_obj_set_style_arc_color(ui.dial_val, col, LV_PART_INDICATOR);
+
+    int picks[4];
+    value_picks(picks);
+    const bool pct = ui.screen != Screen::AdjustAttach && !lb_mode();
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *b = ui.val_pick[i];
+        lv_obj_t *lbl = lv_obj_get_child(b, 0);
+        if (picks[i] == 0) lv_label_set_text(lbl, "Off");
+        else lv_label_set_text_fmt(lbl, ecc ? (pct ? "+%d%%" : "+%d") : (pct ? "%d%%" : "%d"), picks[i]);
+        lv_obj_set_user_data(b, (void *)(intptr_t)picks[i]);
+        const bool on = picks[i] == v;
+        // beyond what the weight allows: shown, but dimmed
+        const bool reachable = picks[i] >= lo && picks[i] <= hi &&
+                               (ui.screen == Screen::AdjustAttach || picks[i] <= (ecc ? ecc_max() : chains_max()));
+        lv_obj_set_style_border_color(b, on ? col : C_TRACK, 0);
+        lv_obj_set_style_bg_color(b, on ? col : C_CARD, 0);
+        lv_obj_set_style_bg_color(b, col, LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(b, on ? LV_OPA_20 : LV_OPA_COVER, 0);
+        lv_obj_set_style_opa(b, reachable ? LV_OPA_COVER : LV_OPA_40, 0);
+    }
+}
+
+void on_value_pick(lv_event_t *e)
+{
+    const int v = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    const int limit = ui.screen == Screen::AdjustAttach ? MAX_ATTACH_LB
+                    : ui.screen == Screen::AdjustEcc ? ecc_max() : chains_max();
+    if (v > limit) {
+        haptics_buzz();   // more than this weight allows
+        return;
+    }
+    set_adjust_value(v);
+    haptics_click();
+    refresh_value();
+}
+
+void build_value()
+{
+    ui.scr_value = make_screen();
+    ui.lbl_val_title = make_header(ui.scr_value, "Attachment", C_ATTACH, on_adjust_done, 0);
+
+    // The dial: 140 px to the middle of its 14 px line, with a white dot at the amount.
+    ui.dial_val = make_dial(ui.scr_value, 294, 14, C_ATTACH);
+    lv_obj_align(ui.dial_val, LV_ALIGN_CENTER, 0, -1);
+    lv_obj_set_style_bg_color(ui.dial_val, C_TEXT, LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(ui.dial_val, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_radius(ui.dial_val, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(ui.dial_val, 7, LV_PART_KNOB);
+
+    lv_obj_t *row = make_value_row(ui.scr_value, &font_poppins_96, &ui.lbl_val_num, &ui.lbl_val_unit);
+    lv_obj_align(row, LV_ALIGN_CENTER, 0, -26);
+    ui.lbl_val_info = make_label(ui.scr_value, &font_poppins_16, C_MUTED, "");
+    lv_label_set_recolor(ui.lbl_val_info, true);
+    lv_obj_set_width(ui.lbl_val_info, 230);
+    lv_obj_set_style_text_align(ui.lbl_val_info, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(ui.lbl_val_info, 4, 0);
+    lv_obj_align(ui.lbl_val_info, LV_ALIGN_CENTER, 0, 62);
+
+    lv_obj_t *picks = lv_obj_create(ui.scr_value);
+    lv_obj_remove_style_all(picks);
+    // Narrower than the screen and lifted: the panel's bottom corners are well rounded.
+    lv_obj_set_size(picks, 320, 48);
+    lv_obj_clear_flag(picks, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(picks, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(picks, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_align(picks, LV_ALIGN_BOTTOM_MID, 0, -36);
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *lbl = nullptr;
+        ui.val_pick[i] = make_pill_button(picks, 74, 48, C_TRACK, "", &lbl);
+        lv_obj_set_style_text_font(lbl, &font_poppins_16, 0);
+        lv_obj_add_event_cb(ui.val_pick[i], on_value_pick, LV_EVENT_CLICKED, nullptr);
+    }
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Connect screen
 // ---------------------------------------------------------------------------
+// Connect-list rows: a device index, or one of these.
+constexpr intptr_t ROW_DISCONNECT = -1;
+constexpr intptr_t ROW_UNTWIN = -2;
+constexpr intptr_t ROW_TWIN_BASE = 1000;   // + device index: twin with that device
+
 void on_device_clicked(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
     intptr_t idx = (intptr_t)lv_obj_get_user_data(btn);
     haptics_click();
     VClient &c = VClient::instance();
+    if (idx == ROW_UNTWIN) {
+        c.untwin();
+        return;
+    }
+    if (idx >= ROW_TWIN_BASE) {
+        // Stay on this screen: its status line follows the twin being set up.
+        const size_t i = (size_t)(idx - ROW_TWIN_BASE);
+        if (i < ui.devs.size()) c.twinWith(ui.devs[i]);
+        return;
+    }
     if (idx < 0) {
         c.disconnect();
         c.scanStart();
@@ -1104,6 +1841,33 @@ void on_close_clicked(lv_event_t *)
     refresh_main();
 }
 
+/**
+ * One row of the connect list. On the watch a full-width card like the settings rows,
+ * with larger text; the label takes recolour markup (the signal strength, muted).
+ */
+lv_obj_t *add_connect_row(const char *icon, const char *text, lv_color_t colour, intptr_t data)
+{
+    lv_obj_t *b = lv_list_add_btn(ui.list, icon, text);
+#ifdef WATCH206
+    lv_obj_set_height(b, 60);
+    lv_obj_set_style_radius(b, 18, 0);
+    lv_obj_set_style_bg_color(b, C_CARD, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(b, C_TRACK, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(b, 0, 0);
+    lv_obj_set_style_pad_hor(b, 18, 0);
+    lv_obj_set_style_pad_column(b, 14, 0);
+    lv_obj_set_style_text_font(b, &font_poppins_18, 0);
+    lv_obj_t *lbl = lv_obj_get_child(b, lv_obj_get_child_cnt(b) - 1);
+    lv_label_set_recolor(lbl, true);
+    lv_label_set_text(lbl, text);   // again, now that markup is on
+#endif
+    lv_obj_set_user_data(b, (void *)data);
+    lv_obj_set_style_text_color(b, colour, 0);
+    lv_obj_add_event_cb(b, on_device_clicked, LV_EVENT_CLICKED, nullptr);
+    return b;
+}
+
 void rebuild_device_list()
 {
     lv_obj_clean(ui.list);
@@ -1112,24 +1876,39 @@ void rebuild_device_list()
         const char *name = st.device_name[0] ? st.device_name : "Voltra";
         char buf[48];
         snprintf(buf, sizeof(buf), "Disconnect %s", name);
-        lv_obj_t *b = lv_list_add_btn(ui.list, LV_SYMBOL_CLOSE, buf);
-        lv_obj_set_user_data(b, (void *)(intptr_t)-1);
-        lv_obj_set_style_text_color(b, C_DANGER, 0);
-        lv_obj_add_event_cb(b, on_device_clicked, LV_EVENT_CLICKED, nullptr);
+        add_connect_row(LV_SYMBOL_CLOSE, buf, C_DANGER, ROW_DISCONNECT);
+    }
+    // Twin mode: offered only on a ready connection, which becomes the host.
+    const bool ready = st.conn == ConnState::Ready;
+    if (ready && st.twin_state > voltra::TWIN_STATE_ALONE) {
+        add_connect_row(LV_SYMBOL_LOOP, "Un-twin", C_WARN, ROW_UNTWIN);
     }
     for (size_t i = 0; i < ui.devs.size(); i++) {
         const FoundDevice &d = ui.devs[i];
         if (st.connected() && strcmp(d.address.c_str(), st.address) == 0) continue;
-        char buf[48];
+        char buf[64];
+#ifdef WATCH206
+        snprintf(buf, sizeof(buf), "%s   #64748b %d dBm#", d.name.c_str(), d.rssi);
+#else
         snprintf(buf, sizeof(buf), "%s  (%d dBm)", d.name.c_str(), d.rssi);
-        lv_obj_t *b = lv_list_add_btn(ui.list, LV_SYMBOL_BLUETOOTH, buf);
-        lv_obj_set_user_data(b, (void *)(intptr_t)i);
-        lv_obj_set_style_text_color(b, C_TEXT, 0);
-        lv_obj_add_event_cb(b, on_device_clicked, LV_EVENT_CLICKED, nullptr);
+#endif
+        add_connect_row(LV_SYMBOL_BLUETOOTH, buf, C_TEXT, (intptr_t)i);
+        // Unknown (no twin status yet) counts as alone: the join works without it.
+        if (ready && st.twin_state <= voltra::TWIN_STATE_ALONE) {
+            snprintf(buf, sizeof(buf), "Twin with %s", d.name.c_str());
+            add_connect_row(LV_SYMBOL_LOOP, buf, C_LOADED, ROW_TWIN_BASE + (intptr_t)i);
+        }
     }
     if (ui.devs.empty() && !st.connected()) {
         lv_obj_t *t = lv_list_add_text(ui.list, "No Voltra found yet.\nSwitch the Voltra on.");
         lv_obj_set_style_text_color(t, C_MUTED, 0);
+#ifdef WATCH206
+        lv_obj_set_style_bg_opa(t, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_font(t, &font_poppins_18, 0);
+        lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(t, LV_PCT(100));
+        lv_obj_set_style_pad_top(t, 40, 0);
+#endif
     }
 }
 
@@ -1148,6 +1927,31 @@ void refresh_connect()
 void build_connect()
 {
     ui.scr_connect = make_screen();
+#ifdef WATCH206
+    // Header, a status line with the scan spinner, then the rows filling the screen.
+    make_header(ui.scr_connect, "Connect", C_TEXT, on_close_clicked, 0);
+    ui.spinner = lv_spinner_create(ui.scr_connect, 1200, 60);
+    lv_obj_set_size(ui.spinner, 22, 22);
+    lv_obj_set_style_arc_width(ui.spinner, 3, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(ui.spinner, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(ui.spinner, C_TRACK, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(ui.spinner, C_UNLOADED, LV_PART_INDICATOR);
+    lv_obj_align(ui.spinner, LV_ALIGN_TOP_LEFT, 36, 90);
+    ui.lbl_conn_status = make_label(ui.scr_connect, &font_poppins_16, C_MUTED, "");
+    lv_label_set_long_mode(ui.lbl_conn_status, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(ui.lbl_conn_status, 300);
+    lv_obj_align(ui.lbl_conn_status, LV_ALIGN_TOP_LEFT, 70, 90);
+
+    ui.list = lv_list_create(ui.scr_connect);
+    lv_obj_set_size(ui.list, 366, 306);   // ends clear of the rounded bottom corners; scrolls
+    lv_obj_align(ui.list, LV_ALIGN_TOP_MID, 0, 126);
+    lv_obj_set_style_bg_opa(ui.list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ui.list, 0, 0);
+    lv_obj_set_style_radius(ui.list, 0, 0);
+    lv_obj_set_style_pad_all(ui.list, 0, 0);
+    lv_obj_set_style_pad_row(ui.list, 8, 0);
+    lv_obj_set_scrollbar_mode(ui.list, LV_SCROLLBAR_MODE_OFF);
+#else
     lv_obj_t *ring = make_ring(ui.scr_connect, C_TRACK);
     lv_obj_set_style_arc_color(ring, C_TRACK, LV_PART_INDICATOR);
     lv_arc_set_value(ring, 0);
@@ -1179,6 +1983,7 @@ void build_connect()
 
     ui.btn_close = make_action_button(ui.scr_connect, "CLOSE");
     lv_obj_add_event_cb(ui.btn_close, on_close_clicked, LV_EVENT_CLICKED, nullptr);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,36 +2001,16 @@ void handle_knob(int delta)
             }
             break;
         }
-        case Screen::AdjustChains: {
-            const int cur = style_amount(ui.adj_style);
-            int v = clampi(apply_step(cur, delta, step), 0, chains_max());
-            if (v != cur) {
-                // Dialling an amount into another style switches the Voltra over to it,
-                // which turns the previous style off.
-                if (v > 0 && ui.style != ui.adj_style) {
-                    ui.style = ui.adj_style;
-                    ui.style_dirty = true;
-                }
-                ui.chains = v;
-                mark_chains_changed();
+        case Screen::AdjustChains:
+        case Screen::AdjustEcc:
+        case Screen::AdjustAttach:
+            if (set_adjust_value(apply_step(adjust_value(), delta, step))) {
                 haptics_tick();
                 refresh_adjust();
             }
             break;
-        }
-        case Screen::AdjustEcc: {
-            int m = ecc_max();
-            int v = clampi(apply_step(ui.ecc, delta, step), -m, m);
-            if (v != ui.ecc) {
-                ui.ecc = v;
-                mark_ecc_changed();
-                haptics_tick();
-                refresh_adjust();
-            }
-            break;
-        }
         case Screen::Settings:
-            break;   // all four bubbles are visible at once; selection is by touch
+            break;   // all the bubbles are visible at once; selection is by touch
         case Screen::Connect:
             lv_obj_scroll_by(ui.list, 0, -delta * 44, LV_ANIM_ON);
             break;
@@ -1238,7 +2023,10 @@ void poll_cb(lv_timer_t *)
     uint32_t now = millis();
 
     int delta = knob_take_delta();
-    if (delta) handle_knob(delta);
+    if (delta) {
+        ui.last_input_ms = now;
+        handle_knob(delta);
+    }
 
     flush_pending(now);
 
@@ -1247,7 +2035,7 @@ void poll_cb(lv_timer_t *)
 
     if (state_changed) {
         ui.last_state_version = c.version();
-        ui.st = c.state();
+        ui.st = ui.demo ? ui.demo_st : c.state();
         if (ui.st.accessory_display != ui.last_display) {
             ui.last_display = ui.st.accessory_display;
             ui.c_dirty = ui.e_dirty = ui.style_dirty = false;
@@ -1275,6 +2063,10 @@ void poll_cb(lv_timer_t *)
         // It ends the moment the status goes to resting or unloading. The fitness mode
         // cannot do this: it stays at 1 through every set after the first.
         const bool moving = ui.st.rep_phase >= 1 && ui.st.rep_phase <= 3;
+        if (!ui.st.loaded()) ui.ecc_learned = false;
+        else if (ui.last_rep_phase == 3 && ui.st.rep_phase != 3) ui.ecc_learned = true;
+        ui.last_rep_phase = ui.st.rep_phase;
+        if (ui.demo && ui.st.reps > 0) ui.ecc_learned = true;
         const int ws = ui.st.workout_status;
         if (!ui.st.loaded()) {
             ui.set_active = false;
@@ -1295,6 +2087,17 @@ void poll_cb(lv_timer_t *)
         ui.auto_load_pending_until = 0;
         if (ui.screen == Screen::Main) refresh_main();
     }
+    if (ui.st.load_refused != ui.last_load_refused) {
+        ui.last_load_refused = ui.st.load_refused;
+        ui.toggle_pending_until = 0;
+        ui.load_refused_until = now + LOAD_REFUSED_SHOW_MS;
+        haptics_buzz();
+        if (ui.screen == Screen::Main) refresh_main();
+    }
+    if (ui.load_refused_until && now >= ui.load_refused_until) {
+        ui.load_refused_until = 0;
+        if (ui.screen == Screen::Main) refresh_main();
+    }
     bool pending_expired = ui.toggle_pending_until && now >= ui.toggle_pending_until;
     if (pending_expired) ui.toggle_pending_until = 0;
 
@@ -1312,6 +2115,7 @@ void poll_cb(lv_timer_t *)
             break;
         case Screen::AdjustChains:
         case Screen::AdjustEcc:
+        case Screen::AdjustAttach:
             if (state_changed) refresh_adjust();
             break;
         case Screen::Connect:
@@ -1335,18 +2139,206 @@ void poll_cb(lv_timer_t *)
             lv_label_set_text(ui.lbl_kbat, LV_SYMBOL_USB);
         }
     }
+
+    // Power off when left alone, but never with the weight on, nor while plugged in.
+    if (ui.st.loaded() || ui.st.auto_loading()) ui.last_input_ms = now;
+    const uint32_t idle = std::min<uint32_t>(now - ui.last_input_ms, lv_disp_get_inactive_time(nullptr));
+    if (idle >= POWER_OFF_IDLE_MS && on_external_power()) {
+        ui.last_input_ms = now;   // look again in another 10 minutes
+        lv_disp_trig_activity(nullptr);
+    } else if (idle >= POWER_OFF_IDLE_MS) {
+        if (ui.screen == Screen::AdjustAttach) save_attach();
+        haptics_buzz();
+        delay(300);   // let the buzz play
+        power_off();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serial commands: screenshots and stand-in states (tools/screenshot.py)
+// ---------------------------------------------------------------------------
+void send_screenshot()
+{
+    lv_obj_t *scr = lv_scr_act();
+    const uint32_t size = lv_snapshot_buf_size_needed(scr, LV_IMG_CF_TRUE_COLOR);
+    void *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    lv_img_dsc_t dsc;
+    if (!buf || lv_snapshot_take_to_buf(scr, LV_IMG_CF_TRUE_COLOR, &dsc, buf, size) != LV_RES_OK) {
+        Serial.print("\nSHOT ERR\n");
+        if (buf) heap_caps_free(buf);
+        return;
+    }
+    Serial.printf("\nSHOT %u %u %d %u\n", (unsigned)dsc.header.w, (unsigned)dsc.header.h,
+                  LV_COLOR_16_SWAP, (unsigned)dsc.data_size);
+    const uint8_t *p = static_cast<const uint8_t *>(buf);
+    for (uint32_t off = 0; off < dsc.data_size; off += 4096) {
+        Serial.write(p + off, std::min<uint32_t>(4096, dsc.data_size - off));
+    }
+    Serial.print("\nEND\n");
+    Serial.flush();
+    heap_caps_free(buf);
+}
+
+/** A connected, activated Voltra at 45 lb in pound mode, nothing on. */
+DeviceState demo_base()
+{
+    DeviceState s;
+    s.conn = ConnState::Ready;
+    strncpy(s.device_name, "VTR-002166", sizeof(s.device_name) - 1);
+    s.protocol_ok = true;
+    s.battery = 82;
+    s.weight = 45;
+    s.chains = 0;
+    s.eccentric_known = true;
+    s.inverse_chains = 0;
+    s.mountain = 0;
+    s.accessory_display = 0;
+    s.fitness_mode = voltra::FITNESS_MODE_STRENGTH_READY;
+    s.workout_status = voltra::WORKOUT_STATUS_UNLOADED;
+    s.activation = 1;
+    s.twin_state = voltra::TWIN_STATE_ALONE;
+    strncpy(s.status, "Connected", sizeof(s.status) - 1);
+    return s;
+}
+
+void demo_loaded(DeviceState &s, int workout_status, uint8_t phase, uint16_t reps)
+{
+    s.fitness_mode = voltra::FITNESS_MODE_STRENGTH_LOADED;
+    s.workout_status = workout_status;
+    s.rep_phase = phase;
+    s.reps = reps;
+    s.sets = 2;
+    s.force_known = true;
+    s.force_lb = 45;
+}
+
+bool run_command(const char *cmd)
+{
+    char verb[12] = {0}, arg[12] = {0};
+    int n = 0;
+    const int got = sscanf(cmd, "%11s %11s %d", verb, arg, &n);
+    if (got < 1) return false;
+
+    if (!strcmp(verb, "shot")) {
+        lv_refr_now(nullptr);
+        send_screenshot();
+        return true;
+    }
+    if (!strcmp(verb, "show") && got >= 2) {
+        const struct { const char *name; Screen s; } screens[] = {
+            {"main", Screen::Main}, {"settings", Screen::Settings}, {"ecc", Screen::AdjustEcc},
+            {"chains", Screen::AdjustChains}, {"attach", Screen::AdjustAttach}, {"connect", Screen::Connect},
+        };
+        for (const auto &e : screens) {
+            if (strcmp(arg, e.name)) continue;
+            ui.adj_style = ui.style;
+            ui.adj_return = Screen::Main;
+            // no fade, so a screenshot straight after shows the new screen
+            ui.screen = e.s;
+            lv_scr_load(screen_obj(e.s));
+            if (e.s == Screen::Main) refresh_main();
+            else if (e.s == Screen::Settings) refresh_settings();
+            else if (e.s == Screen::Connect) { rebuild_device_list(); refresh_connect(); }
+            else refresh_adjust();
+            return true;
+        }
+        return false;
+    }
+    if (!strcmp(verb, "demo") && got >= 2 && !strcmp(arg, "devs")) {
+        // Two Voltras in range, for the connect screen (until the next scan result).
+        ui.devs.clear();
+        const char *names[2] = {"VTR-066162", "VTR-104377"};
+        const int rssi[2] = {-58, -74};
+        for (int i = 0; i < 2; i++) {
+            FoundDevice d;
+            d.name = names[i];
+            d.address = i ? "d4:3c:11:20:9a:05" : "80:b5:4e:07:02:a7";
+            d.rssi = rssi[i];
+            ui.devs.push_back(d);
+        }
+        if (ui.screen == Screen::Connect) rebuild_device_list();
+        return true;
+    }
+    if (!strcmp(verb, "demo") && got >= 2) {
+        DeviceState s = demo_base();
+        if (!strcmp(arg, "off")) {
+            ui.demo = false;
+            ui.last_dev_version = 0xFFFFFFFF;   // back to the real scan results
+            load_attach();   // undo any "set attach"
+        } else if (!strcmp(arg, "idle")) {
+            ui.demo = true;
+        } else if (!strcmp(arg, "loaded")) {
+            demo_loaded(s, voltra::WORKOUT_STATUS_RESTING, 0, 0);
+            s.sets = 0;
+            ui.demo = true;
+        } else if (!strcmp(arg, "set")) {
+            demo_loaded(s, voltra::WORKOUT_STATUS_ACTIVE, 1, 7);
+            ui.demo = true;
+        } else if (!strcmp(arg, "ecc")) {
+            demo_loaded(s, voltra::WORKOUT_STATUS_ACTIVE, 3, 7);
+            s.eccentric_lb = 15;
+            ui.demo = true;
+        } else if (!strcmp(arg, "twin")) {
+            s.twin_state = voltra::TWIN_STATE_TWINNED;
+            s.twin_peer_battery = 64;
+            ui.demo = true;
+        } else {
+            return false;
+        }
+        // keep settings changed with "set" across demo states
+        if (ui.demo_st.conn == ConnState::Ready) {
+            if (strcmp(arg, "ecc")) s.eccentric_lb = ui.demo_st.eccentric_lb;
+            s.chains_lb = ui.demo_st.chains_lb;
+            s.weight = ui.demo_st.weight;
+        }
+        ui.demo_st = s;
+        ui.w_dirty = ui.c_dirty = ui.e_dirty = false;
+        ui.editing_until = 0;
+        ui.last_state_version = 0xFFFFFFFF;   // picked up on the next poll
+        return true;
+    }
+    if (!strcmp(verb, "set") && got == 3) {
+        DeviceState &s = ui.demo_st;
+        if (s.conn != ConnState::Ready) s = demo_base();
+        if (!strcmp(arg, "attach")) ui.attach = clampi(n, 0, MAX_ATTACH_LB);
+        else if (!strcmp(arg, "ecc")) s.eccentric_lb = n;
+        else if (!strcmp(arg, "chains")) s.chains_lb = n;
+        else if (!strcmp(arg, "weight")) s.weight = n;
+        else if (!strcmp(arg, "reps")) s.reps = (uint16_t)n;
+        else return false;
+        ui.last_state_version = 0xFFFFFFFF;
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
+
+bool ui_command(const char *cmd)
+{
+    LvLock lock;
+    ui.last_input_ms = millis();   // someone is at the other end: stay on
+    const bool ok = run_command(cmd);
+    if (!ok) Serial.printf("\nERR %s\n", cmd);
+    else if (strncmp(cmd, "shot", 4)) Serial.print("\nOK\n");
+    return ok;
+}
 
 void ui_init()
 {
     build_main();
     build_settings();
+#ifdef WATCH206
+    build_value();
+#else
     build_adjust();
+#endif
     build_connect();
     lv_scr_load(ui.scr_main);
+    load_attach();
+    ui.last_input_ms = millis();
     ui.st = VClient::instance().state();
+    ui.last_load_refused = ui.st.load_refused;
     refresh_main();
     lv_timer_create(poll_cb, 25, nullptr);
 }

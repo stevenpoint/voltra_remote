@@ -4,3 +4,5 @@
 __pycache__/
 # preview written by tools/gen_icons.py --preview
 icons.png
+# earlier patch files, already applied to src/ and include/
+kirby-patch/
