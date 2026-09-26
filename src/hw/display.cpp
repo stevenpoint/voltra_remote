@@ -5,6 +5,7 @@
 
 #include <assert.h>
 
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
@@ -101,7 +102,9 @@ void display_unlock()
 
 void display_init()
 {
-    // Backlight off while the panel initialises
+    // Backlight off while the panel initialises. Waking from power_off() the pin is
+    // still held low, which would lock it there.
+    gpio_hold_dis((gpio_num_t)PIN_LCD_BL);
     ledcAttach(PIN_LCD_BL, 50000, 8);
     ledcWrite(PIN_LCD_BL, 0);
 

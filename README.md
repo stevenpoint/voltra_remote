@@ -19,10 +19,19 @@ Beyond-Power-HomeAssistant / Beyond-Power-Voltra-Android and jpamorgan's voltra-
 | Hold the weight | Voltra auto load (pull and hold the cable, 3 s countdown) |
 | Tap again on "CABLE OUT: TAP TO OVERRIDE" | Load at once with the cable pulled out |
 | Swipe up / down | Weight +/- 1 lb, 5 lb steps when swiping fast |
-| Gear button | Eccentric, chains, inverse chains, mountain |
+| Gear button | Eccentric, chains, inverse chains, mountain, attachment |
 | Tap the Bluetooth bar at the top | Connect screen: pick a Voltra, twin, un-twin |
 
 The tick marks around the screen edge show the weight; they turn green while loaded.
+With eccentric on, the weight follows each rep: the base weight on the pull, and base
+plus eccentric (in pink) on the way back.
+
+**Attachment** (0 to 50 lb) is the weight of whatever hangs on the cable, such as a bar. It
+is added to the weight on screen but never sent to the Voltra: with a 50 lb attachment and
+the Voltra at 30 lb, the screen shows 80 lb. It is remembered across restarts.
+
+The watch switches itself off after 10 minutes without a touch, unless the Voltra is
+loaded or the watch is plugged in. The side button turns it back on.
 
 ## What you need
 

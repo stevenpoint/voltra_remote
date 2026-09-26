@@ -9,6 +9,7 @@ and recolour them like text.
   U+E002  inverse chains  the chain link knocked out of a filled disc
   U+E003  mountain        a peak with a smaller one in front of its left flank
   U+E004  settings        five dots in a plus (the Voltra's settings button)
+  U+E005  attachment      a barbell seen side on: a bar through two plates each end
 
 Shapes are drawn in their own design units at high resolution, then box-filtered
 down to the target size. Needs Pillow.
@@ -117,6 +118,16 @@ def draw_settings(draw, s):
         draw.ellipse([(x - r) * s, (y - r) * s, (x + r) * s, (y + r) * s], fill=255)
 
 
+def draw_attachment(draw, s):
+    # the bar, then two plates either side, the inner ones taller
+    draw.rectangle([-250 * s, -22 * s, 250 * s, 22 * s], fill=255)
+    for x, w, h in ((120, 60, 240), (196, 50, 160)):
+        for sx in (-1, 1):
+            cx = sx * x
+            draw.rounded_rectangle([(cx - w / 2) * s, -h / 2 * s, (cx + w / 2) * s, h / 2 * s],
+                                   radius=10 * s, fill=255)
+
+
 # (label, draw function, max width px, max height px) at the 26 px design size; other
 # sizes scale these
 ICONS = [
@@ -125,6 +136,7 @@ ICONS = [
     ("inverse chains", draw_inverse, 24, 24),
     ("mountain", draw_mountain, 27, 16),
     ("settings", draw_settings, 24, 24),
+    ("attachment", draw_attachment, 27, 18),
 ]
 
 

@@ -161,6 +161,9 @@
 #define LV_USE_FLEX 1
 #define LV_USE_GRID 0
 
+/* Screenshots over USB serial (ui_command "shot") */
+#define LV_USE_SNAPSHOT 1
+
 /*==================
  * DEMOS / EXAMPLES
  *==================*/

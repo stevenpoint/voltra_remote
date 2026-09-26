@@ -10,6 +10,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "ui/ui.h"
+
 extern "C" int log_printfv(const char *format, va_list arg);   // esp32-hal-uart.c
 
 namespace {
@@ -105,6 +107,10 @@ void handle_command(const String &cmd)
         LittleFS.remove(LOG_PATH);
         open_log();
         Serial.print("\n=== VOLTRA LOG CLEARED ===\n");
+    } else {
+        s_quiet = true;   // keep log lines out of a screenshot's bytes
+        ui_command(cmd.c_str());
+        s_quiet = false;
     }
 }
 

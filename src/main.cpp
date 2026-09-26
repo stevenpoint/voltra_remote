@@ -42,5 +42,21 @@ void setup()
 
 void loop()
 {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+#if !VOLTRA_DIAG
+    // Serial commands (screenshots, tools/screenshot.py). The diagnostic builds read
+    // serial in the flash log's task instead, which passes these on.
+    static char line[48];
+    static size_t len = 0;
+    while (Serial.available()) {
+        const char ch = (char)Serial.read();
+        if (ch == '\n' || ch == '\r') {
+            line[len] = 0;
+            if (len) ui_command(line);
+            len = 0;
+        } else if (len < sizeof(line) - 1) {
+            line[len++] = ch;
+        }
+    }
+#endif
+    vTaskDelay(pdMS_TO_TICKS(50));
 }

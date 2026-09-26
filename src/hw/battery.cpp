@@ -3,6 +3,7 @@
 #ifdef WATCH206
 // Watch 2.06: the battery sits behind an AXP2101 PMIC on the shared I2C bus.
 #include <Arduino.h>
+#include "esp_sleep.h"
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
 
@@ -67,9 +68,25 @@ int battery_percent()
     return s_ok ? s_pmu.getBatteryPercent() : -1;   // PMIC fuel gauge, -1 without a battery
 }
 
+bool on_external_power()
+{
+    return (s_ok && s_pmu.isVbusIn()) || HWCDC::isPlugged();
+}
+
+void power_off()
+{
+    if (s_ok) s_pmu.shutdown();
+    // No PMIC: sleep with no wake source, so only a reset brings it back.
+    esp_deep_sleep_start();
+}
+
 #else
 
 #include <Arduino.h>
+
+#include "driver/gpio.h"
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
 
 #include "board_pins.h"
 
@@ -111,5 +128,38 @@ int battery_percent()
         }
     }
     return 0;
+}
+
+bool on_external_power()
+{
+    // No power sensing on the knob's USB port: a computer at the other end is what counts.
+    return HWCDC::isPlugged();
+}
+
+void power_off()
+{
+    // Backlight off, and held off through sleep: GPIO 47 is not an RTC pin, so it would
+    // otherwise float. display_init() releases the hold on the next boot.
+    ledcWrite(PIN_LCD_BL, 0);
+    ledcDetach(PIN_LCD_BL);
+    pinMode(PIN_LCD_BL, OUTPUT);
+    digitalWrite(PIN_LCD_BL, LOW);
+    gpio_hold_en((gpio_num_t)PIN_LCD_BL);
+    gpio_deep_sleep_hold_en();
+
+    // Wake on a touch (the touch controller pulls its interrupt low) or a turn of the
+    // knob (either encoder line pulsing low). An encoder line already resting low would
+    // wake it at once, so it is left out.
+    uint64_t mask = 1ULL << PIN_TOUCH_INT;
+    if (gpio_get_level((gpio_num_t)PIN_ENC_A)) mask |= 1ULL << PIN_ENC_A;
+    if (gpio_get_level((gpio_num_t)PIN_ENC_B)) mask |= 1ULL << PIN_ENC_B;
+    for (int pin = 0; pin < 64; pin++) {
+        if (!(mask & (1ULL << pin))) continue;
+        rtc_gpio_pullup_en((gpio_num_t)pin);
+        rtc_gpio_pulldown_dis((gpio_num_t)pin);
+    }
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);   // keep the pull-ups
+    esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
 }
 #endif
