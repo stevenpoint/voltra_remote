@@ -269,6 +269,21 @@ void test_rep_telemetry()
     TEST_ASSERT_EQUAL_UINT8(1, rep.phase);
 }
 
+void test_rep_telemetry_twinned()
+{
+    // captured from a twinned host: return phase, set 1, rep 1
+    const uint8_t payload[] = {0x81, 0x42, 0x03, 0x01, 0x00, 0x01, 0x00, 0x64, 0x00, 0xa4, 0x01, 0x2e};
+    uint8_t buf[64];
+    size_t n = build_frame(buf, sizeof(buf), CMD_TELEMETRY, payload, sizeof(payload), 3, 0x10, 0xAA);
+    Packet p;
+    TEST_ASSERT_TRUE(parse_packet(buf, n, p));
+    RepTelemetry rep;
+    TEST_ASSERT_TRUE(parse_rep_telemetry(p, rep));
+    TEST_ASSERT_EQUAL_UINT8(3, rep.phase);
+    TEST_ASSERT_EQUAL_UINT8(1, rep.set_count);
+    TEST_ASSERT_EQUAL_UINT16(1, rep.rep_count);
+}
+
 void test_activation()
 {
     const uint8_t payload[] = {0x00, 0x01};
@@ -487,6 +502,7 @@ int main(int, char **)
     RUN_TEST(test_decode_param_read_response_with_status_byte);
     RUN_TEST(test_assembler_handles_fragments_and_packing);
     RUN_TEST(test_rep_telemetry);
+    RUN_TEST(test_rep_telemetry_twinned);
     RUN_TEST(test_activation);
     RUN_TEST(test_fine_steps_are_one_pound);
     RUN_TEST(test_coarse_steps_snap_to_multiples_of_five);

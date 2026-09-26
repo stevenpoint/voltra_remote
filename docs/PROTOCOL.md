@@ -98,7 +98,8 @@ The Voltra pushes workout telemetry on command `0xAA`. Two frames matter here:
 
 - **Rep telemetry** `81 2B phase set rep_hi rep_lo …`: `phase` is `0` idle, `1` pull,
   `2` transition, `3` return; `set` is the Voltra's set counter; the rep count is
-  big-endian.
+  big-endian. A twinned host sends `81 42` instead (68 bytes rather than 45), with the
+  same phase, set and rep bytes at the start (*captured*).
 - **Workout status** `80 25 01 00 SS …`, pushed the moment it changes (*captured*):
 
   | `SS` | Meaning |

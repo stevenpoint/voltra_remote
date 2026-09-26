@@ -314,7 +314,9 @@ bool parse_rep_telemetry(const Packet &pkt, RepTelemetry &out)
 {
     if (pkt.cmd != CMD_TELEMETRY || pkt.payload_len < 6) return false;
     const uint8_t *p = pkt.payload;
-    if (p[0] != 0x81 || p[1] != 0x2B) return false;
+    // 81 2B from a single unit; a twinned host sends a longer 81 42 frame that starts
+    // the same way (captured).
+    if (p[0] != 0x81 || (p[1] != 0x2B && p[1] != 0x42)) return false;
     out.phase = p[2];
     out.set_count = p[3];
     out.rep_count = (uint16_t)((p[4] << 8) | p[5]);   // big-endian
