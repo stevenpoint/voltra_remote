@@ -10,6 +10,21 @@ build is kept alongside. Protocol work builds on Omar Shahine's
 [voltra-knob](https://github.com/omarshahine/voltra-knob), dylanmaniatakes'
 Beyond-Power-HomeAssistant / Beyond-Power-Voltra-Android and jpamorgan's voltra-sdk.
 
+<table>
+<tr>
+<td align="center"><img src="docs/screenshots/main.png" width="205" alt="Main screen: 90 lb, the Voltra's 45 plus a 45 lb attachment, with eccentric and attachment dials"><br>Ready to load</td>
+<td align="center"><img src="docs/screenshots/set.png" width="205" alt="During a set: 60 lb on the return with +15 eccentric, set 2, 7 reps"><br>During a set</td>
+<td align="center"><img src="docs/screenshots/settings.png" width="205" alt="Settings list: attachment, eccentric, chains, inverse chains, mountain"><br>Settings</td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/eccentric.png" width="205" alt="Eccentric dial at +15 lb with quick picks"><br>Eccentric</td>
+<td align="center"><img src="docs/screenshots/attachment.png" width="205" alt="Attachment dial at 45 lb, 90 lb in total"><br>Attachment</td>
+<td align="center"><img src="docs/screenshots/connect.png" width="205" alt="Connect screen listing nearby Voltras"><br>Connect</td>
+</tr>
+</table>
+
+Screenshots come straight off the watch (`tools/screenshot.py`).
+
 ## What it does
 
 | Gesture | Action |
@@ -19,12 +34,14 @@ Beyond-Power-HomeAssistant / Beyond-Power-Voltra-Android and jpamorgan's voltra-
 | Hold the weight | Voltra auto load (pull and hold the cable, 3 s countdown) |
 | Tap again on "CABLE OUT: TAP TO OVERRIDE" | Load at once with the cable pulled out |
 | Swipe up / down | Weight +/- 1 lb, 5 lb steps when swiping fast |
-| Gear button | Eccentric, chains, inverse chains, mountain, attachment |
+| Gear button | Settings: attachment, eccentric, chains, inverse chains, mountain |
+| Tap an accessory dial under the weight | Adjust that accessory |
 | Tap the Bluetooth bar at the top | Connect screen: pick a Voltra, twin, un-twin |
 
-The tick marks around the screen edge show the weight; they turn green while loaded.
+The rail around the screen edge shows the weight: white while unloaded, green while loaded.
 With eccentric on, the weight follows each rep: the base weight on the pull, and base
-plus eccentric (in pink) on the way back.
+plus eccentric on the way back (from the second rep, once the Voltra knows the rep
+length). The line under the weight says which.
 
 **Attachment** (0 to 50 lb) is the weight of whatever hangs on the cable, such as a bar. It
 is added to the weight on screen but never sent to the Voltra: with a 50 lb attachment and

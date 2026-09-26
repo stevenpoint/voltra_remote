@@ -11,7 +11,8 @@ src/ui/ui.h): "show settings", "demo ecc", "set attach 45"... The demo states st
 Voltra, so no Voltra is needed; "demo off" goes back to the real one and the saved
 attachment weight.
 
-Plug the watch in over USB first, and close any serial monitor.
+Plug the watch in over USB first, and close any serial monitor. Opening the port restarts
+the watch, which drops any demo state, so give all of a screenshot's commands in one run.
 """
 
 import argparse
