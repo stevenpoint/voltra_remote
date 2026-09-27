@@ -12,7 +12,8 @@ Voltra, so no Voltra is needed; "demo off" goes back to the real one and the sav
 attachment weight.
 
 Plug the watch in over USB first, and close any serial monitor. Opening the port restarts
-the watch, which drops any demo state, so give all of a screenshot's commands in one run.
+the watch, so give all of a screenshot's commands in one run. Every run ends by putting
+the watch back on the real Voltra.
 """
 
 import argparse
@@ -62,8 +63,24 @@ def open_port(name):
     # Keep both lines low: toggling them is how esptool resets the chip.
     ser.dtr = False
     ser.rts = False
+    ser.write_timeout = 5
     ser.open()
     return ser
+
+
+def wait_ready(ser, timeout_s=15):
+    """Opening the port restarts the watch: wait until it answers again."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        ser.reset_input_buffer()
+        ser.write(b"\nping\n")
+        buf = b""
+        end = time.time() + 1
+        while time.time() < end:
+            buf += ser.read(256)
+            if b"\nOK\n" in buf:
+                return
+    sys.exit("The watch did not answer. Is a build with screenshots flashed?")
 
 
 def command(ser, cmd, timeout_s=3):
@@ -138,14 +155,21 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     ser = open_port(args.port or find_port())
-    if args.all:
-        for name, cmds in ALL:
-            capture(ser, cmds, os.path.join(args.out, name + ".png"))
+    wait_ready(ser)
+    try:
+        if args.all:
+            for name, cmds in ALL:
+                capture(ser, cmds, os.path.join(args.out, name + ".png"))
+        else:
+            capture(ser, args.commands, os.path.join(args.out, args.name + ".png"))
+    finally:
+        # Never leave the watch on a stand-in Voltra (it would also lapse on its own).
         for c in RESTORE:
-            command(ser, c)
-    else:
-        capture(ser, args.commands, os.path.join(args.out, args.name + ".png"))
-    ser.close()
+            try:
+                command(ser, c)
+            except SystemExit:
+                pass
+        ser.close()
 
 
 if __name__ == "__main__":

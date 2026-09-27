@@ -72,6 +72,11 @@ constexpr uint32_t AUTO_LOAD_PENDING_MS = 4000;
 constexpr uint32_t POWER_OFF_IDLE_MS = 10 * 60 * 1000;
 // Attachment (bar, handle...) weight added to the displayed weight, never sent to the Voltra.
 constexpr int MAX_ATTACH_LB = 50;
+// A stand-in Voltra (serial "demo") left on by mistake would hide the real one, so it
+// lapses this long after the last serial command.
+constexpr uint32_t DEMO_TIMEOUT_MS = 2 * 60 * 1000;
+// After asking two connected Voltras to pair, how long to wait for the host to report it.
+constexpr uint32_t PAIR_WINDOW_MS = 30000;
 
 enum class Screen { Main, Settings, AdjustChains, AdjustEcc, AdjustAttach, Connect };
 
@@ -211,10 +216,32 @@ struct Ui {
     uint32_t last_input_ms = 0;   // last knob turn or swipe (touches are LVGL's own count)
     // Stand-in Voltra state for screenshots (ui_command "demo"), used in place of the real one.
     bool demo = false;
+    uint32_t last_cmd_ms = 0;     // last serial command: the stand-in lapses without them
     DeviceState demo_st;
     DeviceState st;
     std::vector<FoundDevice> devs;
+
+    // Two Voltras (voltra::Client::COUNT): the one on screen, and the other one.
+    int active = 0;
+    DeviceState st_other;
+    uint32_t last_other_version = 0xFFFFFFFF;
+    bool dual = false;            // both in use: the top bar shows both, tap to switch
+    int twin_host = -1;           // slot hosting a twin made or seen here, -1 none
+    uint32_t pair_until = 0;      // a pair was just asked for: let it settle
+    bool pair_pending = false;    // waiting for the other to be let go before twinning
+    uint32_t last_pair_poll = 0;
 } ui;
+
+/** The Voltra on screen, and the other one. */
+VClient &vc() { return VClient::instance(ui.active); }
+VClient &vc_other() { return VClient::instance(1 - ui.active); }
+/** Slot 0 runs the scan behind the connect screen. */
+VClient &scanner() { return VClient::instance(0); }
+const DeviceState &slot_state(int slot) { return slot == ui.active ? ui.st : ui.st_other; }
+bool slot_busy(const DeviceState &s)
+{
+    return s.connected() || s.conn == ConnState::Connecting || s.conn == ConnState::Reconnecting;
+}
 
 int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -646,7 +673,7 @@ void mark_ecc_changed()
 
 void flush_pending(uint32_t now)
 {
-    VClient &c = VClient::instance();
+    VClient &c = vc();
     if (ui.w_dirty && now - ui.w_changed >= SEND_DEBOUNCE_MS) {
         ui.w_dirty = false;
         if (ui.st.connected()) c.setWeight(ui.weight);
@@ -771,13 +798,14 @@ const char *const PRESET_KEYS[2] = {"preset0", "preset1"};
     p.end();
 }
 
-constexpr const char *ATTACH_KEY = "attach";
+/** The attachment is kept per Voltra: each may have its own bar or handle on. */
+const char *attach_key() { return ui.active == 0 ? "attach" : "attach1"; }
 
 void load_attach()
 {
     Preferences p;
     if (!p.begin(PRESET_NS, true)) return;
-    ui.attach = clampi(p.getUChar(ATTACH_KEY, 0), 0, MAX_ATTACH_LB);
+    ui.attach = clampi(p.getUChar(attach_key(), 0), 0, MAX_ATTACH_LB);
     p.end();
 }
 
@@ -785,8 +813,28 @@ void save_attach()
 {
     Preferences p;
     if (!p.begin(PRESET_NS, false)) return;
-    if (p.getUChar(ATTACH_KEY, 0) != ui.attach) p.putUChar(ATTACH_KEY, (uint8_t)ui.attach);
+    if (p.getUChar(attach_key(), 0) != ui.attach) p.putUChar(attach_key(), (uint8_t)ui.attach);
     p.end();
+}
+
+/** Put the other Voltra on screen. Edits not yet sent go to the one being left. */
+void switch_to(int slot)
+{
+    if (slot == ui.active) return;
+    flush_pending(millis() + SEND_DEBOUNCE_MS);
+    save_attach();
+    ui.active = slot;
+    ui.w_dirty = ui.c_dirty = ui.e_dirty = ui.style_dirty = false;
+    ui.editing_until = 0;
+    ui.toggle_pending_until = ui.auto_load_pending_until = ui.load_refused_until = 0;
+    ui.set_active = ui.ecc_learned = false;
+    ui.last_rep_phase = ui.shown_phase = 0;
+    ui.last_display = -2;
+    ui.last_state_version = ui.last_other_version = 0xFFFFFFFF;
+    std::swap(ui.st, ui.st_other);
+    ui.last_load_refused = ui.st.load_refused;
+    load_attach();
+    haptics_double();
 }
 
 void save_preset(int i)
@@ -873,8 +921,10 @@ void on_preset_hold(lv_event_t *e)
 constexpr const char *L_WEIGHT_UNIT = "lb";
 constexpr const char *L_TXT_LOAD = "TAP TO LOAD";
 constexpr const char *L_TXT_UNLOAD = "TAP TO UNLOAD";
-constexpr int L_CENTER_W = 330, L_CENTER_H = 254, L_CENTER_Y = -54;
-constexpr int L_ROW_Y = 22;       // weight row, from the centre of its touch target
+// The weight's touch target starts 12 px below the top bar's, so a tap meant for the
+// batteries (switching Voltras) does not load.
+constexpr int L_CENTER_W = 330, L_CENTER_H = 230, L_CENTER_Y = -42;
+constexpr int L_ROW_Y = 10;       // weight row, from the centre of its touch target
 constexpr int L_REPS_Y = 52;
 constexpr int L_DOCK_Y = 151;
 constexpr int L_COUNT_X = 77, L_COUNT_CAP_Y = 104, L_COUNT_NUM_Y = 152;
@@ -966,13 +1016,33 @@ void refresh_main()
 
     // top bar: Bluetooth icon (blue when connected, white when not) and, once connected,
     // the Voltra's battery level. Recolour markup colours just the icon.
-    char top[96];
+    char top[128];
     const char *bt_hex = connected ? C_BT_HEX : C_WHITE_HEX;
     auto battery_sym = [](int pct) {
         return pct > 80 ? LV_SYMBOL_BATTERY_FULL : pct > 60 ? LV_SYMBOL_BATTERY_3
              : pct > 40 ? LV_SYMBOL_BATTERY_2 : pct > 15 ? LV_SYMBOL_BATTERY_1 : LV_SYMBOL_BATTERY_EMPTY;
     };
-    if (connected && st.battery >= 0) {
+    // Two Voltras in use: both, left and right by slot, the one on screen in white.
+    ui.dual = !ui.demo && !vc_other().paused() && slot_busy(ui.st_other) && !st.twinned();
+    if (ui.dual) {
+        size_t n = 0;
+        for (int i = 0; i < VClient::COUNT; i++) {
+            const DeviceState &s = slot_state(i);
+            const char *name = s.device_name[0] ? s.device_name : "Voltra";
+            const size_t len = strlen(name);
+            const char *tail = len > 4 ? name + len - 4 : name;   // "VTR-002166" -> "2166"
+            const bool on = i == ui.active;
+            char bat[24] = "";
+            if (s.connected() && s.battery >= 0) snprintf(bat, sizeof(bat), "  %s %d%%", battery_sym(s.battery), s.battery);
+            if (on) {
+                n += snprintf(top + n, sizeof(top) - n, "#%s " LV_SYMBOL_BLUETOOTH "# %s%s",
+                              s.connected() ? C_BT_HEX : C_WHITE_HEX, tail, bat);
+            } else {
+                n += snprintf(top + n, sizeof(top) - n, "#64748b " LV_SYMBOL_BLUETOOTH " %s%s#", tail, bat);
+            }
+            if (i == 0) n += snprintf(top + n, sizeof(top) - n, "     ");
+        }
+    } else if (connected && st.battery >= 0) {
         snprintf(top, sizeof(top), "#%s " LV_SYMBOL_BLUETOOTH "#   %s %d%%", bt_hex, battery_sym(st.battery),
                  st.battery);
         if (st.twinned() && st.twin_peer_battery >= 0) {
@@ -1108,7 +1178,7 @@ void refresh_main()
 
 void on_center_clicked(lv_event_t *)
 {
-    VClient &c = VClient::instance();
+    VClient &c = vc();
     if (!ui.st.connected()) {
         haptics_click();
         show(Screen::Connect);
@@ -1142,6 +1212,8 @@ void on_center_clicked(lv_event_t *)
         return;
     }
     bool loaded = ui.st.loaded();
+    log_i("ui: %s tapped on slot %d (%s), conn %d, mode %d", loaded ? "unload" : "load", ui.active,
+          ui.st.device_name, (int)ui.st.conn, ui.st.fitness_mode);
     ui.toggle_target_loaded = !loaded;
     ui.toggle_pending_until = millis() + TOGGLE_PENDING_MS;
     if (loaded) c.unload(); else c.load();
@@ -1160,16 +1232,30 @@ void on_center_hold(lv_event_t *)
     ui.toggle_pending_until = 0;
     ui.load_refused_until = 0;
     ui.auto_load_pending_until = millis() + AUTO_LOAD_PENDING_MS;
-    VClient::instance().autoLoad();
+    vc().autoLoad();
     haptics_double();
     refresh_main();
 }
 
+/**
+ * Top bar: with two Voltras in use, tapping the other one's half puts it on screen;
+ * otherwise (or on the one already on screen) it opens the connect screen.
+ */
 void on_top_clicked(lv_event_t *)
 {
+    if (ui.dual) {
+        lv_point_t p;
+        lv_indev_get_point(lv_indev_get_act(), &p);
+        const int slot = p.x < lv_obj_get_width(lv_scr_act()) / 2 ? 0 : 1;
+        if (slot != ui.active) {
+            switch_to(slot);
+            refresh_main();
+            return;
+        }
+    }
     haptics_click();
     show(Screen::Connect);
-    VClient::instance().scanStart();
+    scanner().scanStart();
 }
 
 void on_gear_clicked(lv_event_t *);
@@ -1233,7 +1319,7 @@ void build_main()
     ui.scr_main = make_screen();
 #ifdef WATCH206
     ui.arc_weight = make_rail(ui.scr_main);
-    constexpr int TOP_BAR_Y = 34;   // below the edge scale's ticks
+    constexpr int TOP_BAR_Y = 26;   // inside the rail
 #else
     ui.arc_weight = make_ring(ui.scr_main, C_IDLE_RING);
     constexpr int TOP_BAR_Y = 20;
@@ -1241,7 +1327,7 @@ void build_main()
 
     // top bar (tap -> connect menu)
 #ifdef WATCH206
-    ui.btn_top = make_flat_button(ui.scr_main, 300, 44);   // twinned it shows two batteries
+    ui.btn_top = make_flat_button(ui.scr_main, 330, 56);   // two Voltras: one half each
 #else
     ui.btn_top = make_flat_button(ui.scr_main, 220, 44);
 #endif
@@ -1800,34 +1886,68 @@ void build_value()
 // Connect screen
 // ---------------------------------------------------------------------------
 // Connect-list rows: a device index, or one of these.
-constexpr intptr_t ROW_DISCONNECT = -1;
 constexpr intptr_t ROW_UNTWIN = -2;
+constexpr intptr_t ROW_PAIR = -3;
+constexpr intptr_t ROW_DISCONNECT_BASE = -10;   // - slot: disconnect that one
 constexpr intptr_t ROW_TWIN_BASE = 1000;   // + device index: twin with that device
+
+/** The slot a newly picked Voltra goes into: the one on screen if free, else the other. */
+int free_slot()
+{
+    if (!slot_busy(ui.st)) return ui.active;
+    if (!slot_busy(ui.st_other) && !vc_other().paused()) return 1 - ui.active;
+    return -1;
+}
 
 void on_device_clicked(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
     intptr_t idx = (intptr_t)lv_obj_get_user_data(btn);
     haptics_click();
-    VClient &c = VClient::instance();
     if (idx == ROW_UNTWIN) {
-        c.untwin();
+        vc().untwin();
+        return;
+    }
+    if (idx == ROW_PAIR) {
+        // The Voltra on screen hosts. A Voltra will not join a twin while we are connected
+        // to both, so let go of the other first; manage_twin() then twins them the way
+        // "Twin with" does, over a short connection of its own. Stay here: the status
+        // follows the pairing.
+        vc_other().pause();
+        ui.twin_host = ui.active;
+        ui.pair_pending = true;
+        ui.pair_until = millis() + PAIR_WINDOW_MS;
+        return;
+    }
+    if (idx <= ROW_DISCONNECT_BASE) {
+        const int slot = (int)(ROW_DISCONNECT_BASE - idx);
+        VClient &c = VClient::instance(slot);
+        c.disconnect();
+        if (slot != 0) c.forgetSavedDevice();   // a second Voltra is only kept while wanted
+        if (slot == ui.active && slot_busy(ui.st_other)) switch_to(1 - slot);
+        scanner().scanStart();
         return;
     }
     if (idx >= ROW_TWIN_BASE) {
         // Stay on this screen: its status line follows the twin being set up.
         const size_t i = (size_t)(idx - ROW_TWIN_BASE);
-        if (i < ui.devs.size()) c.twinWith(ui.devs[i]);
+        if (i < ui.devs.size()) {
+            vc().twinWith(ui.devs[i]);
+            ui.twin_host = ui.active;   // the one on screen hosts
+            ui.pair_until = millis() + PAIR_WINDOW_MS;
+        }
         return;
     }
-    if (idx < 0) {
-        c.disconnect();
-        c.scanStart();
-        return;
-    }
-    if ((size_t)idx < ui.devs.size()) {
-        c.scanStop();
-        c.connectTo(ui.devs[idx]);
+    int slot = free_slot();
+    if (slot >= 0 && idx >= 0 && (size_t)idx < ui.devs.size()) {
+        // A Voltra the other slot already knows goes back there, never into both.
+        const int other = 1 - slot;
+        if (!slot_busy(slot_state(other)) &&
+            strcasecmp(VClient::instance(other).savedAddress().c_str(), ui.devs[idx].address.c_str()) == 0) {
+            slot = other;
+        }
+        scanner().scanStop();
+        VClient::instance(slot).connectTo(ui.devs[idx]);
         show(Screen::Main);
         refresh_main();
     }
@@ -1836,7 +1956,7 @@ void on_device_clicked(lv_event_t *e)
 void on_close_clicked(lv_event_t *)
 {
     haptics_click();
-    VClient::instance().scanStop();
+    scanner().scanStop();
     show(Screen::Main);
     refresh_main();
 }
@@ -1872,20 +1992,33 @@ void rebuild_device_list()
 {
     lv_obj_clean(ui.list);
     const DeviceState &st = ui.st;
-    if (st.connected() || st.conn == ConnState::Connecting || st.conn == ConnState::Reconnecting) {
-        const char *name = st.device_name[0] ? st.device_name : "Voltra";
+    // A disconnect row for each Voltra in use, in slot order.
+    for (int slot = 0; slot < VClient::COUNT; slot++) {
+        const DeviceState &s = slot_state(slot);
+        if (!slot_busy(s)) continue;
         char buf[48];
-        snprintf(buf, sizeof(buf), "Disconnect %s", name);
-        add_connect_row(LV_SYMBOL_CLOSE, buf, C_DANGER, ROW_DISCONNECT);
+        snprintf(buf, sizeof(buf), "Disconnect %s", s.device_name[0] ? s.device_name : "Voltra");
+        add_connect_row(LV_SYMBOL_CLOSE, buf, C_DANGER, ROW_DISCONNECT_BASE - slot);
     }
     // Twin mode: offered only on a ready connection, which becomes the host.
     const bool ready = st.conn == ConnState::Ready;
+    const bool other_ready = ui.st_other.conn == ConnState::Ready;
     if (ready && st.twin_state > voltra::TWIN_STATE_ALONE) {
         add_connect_row(LV_SYMBOL_LOOP, "Un-twin", C_WARN, ROW_UNTWIN);
     }
-    for (size_t i = 0; i < ui.devs.size(); i++) {
+    // Both connected and neither twinned: pair them, the one on screen hosting.
+    if (ready && other_ready && st.twin_state <= voltra::TWIN_STATE_ALONE &&
+        ui.st_other.twin_state <= voltra::TWIN_STATE_ALONE) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Pair %s + %s", st.device_name, ui.st_other.device_name);
+        add_connect_row(LV_SYMBOL_LOOP, buf, C_LOADED, ROW_PAIR);
+    }
+    // Voltras in range, while there is a slot for one.
+    const bool room = free_slot() >= 0;
+    for (size_t i = 0; room && i < ui.devs.size(); i++) {
         const FoundDevice &d = ui.devs[i];
-        if (st.connected() && strcmp(d.address.c_str(), st.address) == 0) continue;
+        if (slot_busy(st) && strcasecmp(d.address.c_str(), st.address) == 0) continue;
+        if (slot_busy(ui.st_other) && strcasecmp(d.address.c_str(), ui.st_other.address) == 0) continue;
         char buf[64];
 #ifdef WATCH206
         snprintf(buf, sizeof(buf), "%s   #64748b %d dBm#", d.name.c_str(), d.rssi);
@@ -2017,10 +2150,78 @@ void handle_knob(int delta)
     }
 }
 
+void demo_off();
+
+/**
+ * Whether slot i hosts a twin. Both units of a twin report being twinned (or joining), so
+ * the host is the one we set the twin up from; failing that, the one whose fitness mode
+ * has taken the twinned host's shape (0x01xx / 0x20xx, docs/PROTOCOL.md).
+ */
+bool hosting(int i)
+{
+    const DeviceState &s = slot_state(i);
+    if (!s.twinned() && s.twin_state != voltra::TWIN_STATE_JOINING) return false;
+    if (ui.twin_host >= 0) return ui.twin_host == i;
+    return s.fitness_mode >= 0 && (s.fitness_mode & 0xFF00) != 0;
+}
+
+/**
+ * Two Voltras and twin mode. While one hosts a twin, the other follows it and takes its
+ * commands through the host, so let go of our own connection to it (it is not forgotten)
+ * and keep the host on screen. Once the host is on its own again, reconnect to the other.
+ */
+void manage_twin(uint32_t now)
+{
+    const bool pairing = (int32_t)(now - ui.pair_until) < 0;
+    for (int i = 0; i < VClient::COUNT; i++) {
+        const DeviceState &hs = slot_state(i);
+        VClient &follower = VClient::instance(1 - i);
+        if (hosting(i)) {
+            if (pairing && hs.twinned() && ui.screen == Screen::Connect) {
+                // Paired: off the connect screen, so the scan stops taking radio time.
+                ui.pair_until = 0;
+                scanner().scanStop();
+                show(Screen::Main);
+                refresh_main();
+            }
+            ui.twin_host = i;
+            const std::string addr = follower.savedAddress();
+            const bool is_peer = !hs.twin_peer[0] || addr.empty() || strcasecmp(addr.c_str(), hs.twin_peer) == 0;
+            if (is_peer && !follower.paused() && slot_busy(slot_state(1 - i))) follower.pause();
+            if (ui.active != i) {
+                switch_to(i);
+                if (ui.screen == Screen::Main) refresh_main();
+            }
+        } else if (ui.twin_host == i && !pairing && hs.conn == ConnState::Ready &&
+                   hs.twin_state == voltra::TWIN_STATE_ALONE) {
+            // un-twinned (or the pairing did not take): back to two Voltras
+            ui.twin_host = -1;
+            if (follower.paused()) follower.resume();
+        }
+    }
+    // Pairing: once the other is let go, the host asks it to join.
+    if (ui.pair_pending && ui.twin_host >= 0 && !slot_busy(slot_state(1 - ui.twin_host))) {
+        ui.pair_pending = false;
+        const FoundDevice dev = VClient::instance(1 - ui.twin_host).savedDevice();
+        if (!dev.address.empty()) VClient::instance(ui.twin_host).twinWith(dev);
+    }
+    for (int i = 0; i < VClient::COUNT; i++) VClient::instance(i).setTwinHost(ui.twin_host == i);
+    // While pairing, ask the host how it is going rather than wait for its next poll.
+    if (pairing && now - ui.last_pair_poll > 3000) {
+        VClient::instance(ui.twin_host >= 0 ? ui.twin_host : ui.active).pollTwin();
+        ui.last_pair_poll = now;
+    }
+}
+
 void poll_cb(lv_timer_t *)
 {
-    VClient &c = VClient::instance();
+    VClient &c = vc();
     uint32_t now = millis();
+
+    if (ui.demo && now - ui.last_cmd_ms > DEMO_TIMEOUT_MS) {
+        demo_off();
+        show(Screen::Main);
+    }
 
     int delta = knob_take_delta();
     if (delta) {
@@ -2031,7 +2232,13 @@ void poll_cb(lv_timer_t *)
     flush_pending(now);
 
     bool state_changed = c.version() != ui.last_state_version;
-    bool devs_changed = c.devicesVersion() != ui.last_dev_version;
+    bool devs_changed = scanner().devicesVersion() != ui.last_dev_version;
+    VClient &o = vc_other();
+    const bool other_changed = o.version() != ui.last_other_version;
+    if (other_changed) {
+        ui.last_other_version = o.version();
+        ui.st_other = o.state();
+    }
 
     if (state_changed) {
         ui.last_state_version = c.version();
@@ -2102,13 +2309,14 @@ void poll_cb(lv_timer_t *)
     if (pending_expired) ui.toggle_pending_until = 0;
 
     if (devs_changed) {
-        ui.last_dev_version = c.devicesVersion();
-        ui.devs = c.devices();
+        ui.last_dev_version = scanner().devicesVersion();
+        ui.devs = scanner().devices();
     }
+    if (!ui.demo) manage_twin(now);
 
     switch (ui.screen) {
         case Screen::Main:
-            if (state_changed || pending_expired) refresh_main();
+            if (state_changed || other_changed || pending_expired) refresh_main();
             break;
         case Screen::Settings:
             if (state_changed) refresh_settings();
@@ -2119,7 +2327,7 @@ void poll_cb(lv_timer_t *)
             if (state_changed) refresh_adjust();
             break;
         case Screen::Connect:
-            if (state_changed || devs_changed) {
+            if (state_changed || other_changed || devs_changed) {
                 rebuild_device_list();
                 refresh_connect();
             }
@@ -2141,7 +2349,7 @@ void poll_cb(lv_timer_t *)
     }
 
     // Power off when left alone, but never with the weight on, nor while plugged in.
-    if (ui.st.loaded() || ui.st.auto_loading()) ui.last_input_ms = now;
+    if (ui.st.loaded() || ui.st.auto_loading() || ui.st_other.loaded()) ui.last_input_ms = now;
     const uint32_t idle = std::min<uint32_t>(now - ui.last_input_ms, lv_disp_get_inactive_time(nullptr));
     if (idle >= POWER_OFF_IDLE_MS && on_external_power()) {
         ui.last_input_ms = now;   // look again in another 10 minutes
@@ -2212,6 +2420,15 @@ void demo_loaded(DeviceState &s, int workout_status, uint8_t phase, uint16_t rep
     s.force_lb = 45;
 }
 
+/** Back to the real Voltra, its scan results and the saved attachment weight. */
+void demo_off()
+{
+    ui.demo = false;
+    ui.last_dev_version = 0xFFFFFFFF;
+    ui.last_state_version = 0xFFFFFFFF;
+    load_attach();   // undo any "set attach"
+}
+
 bool run_command(const char *cmd)
 {
     char verb[12] = {0}, arg[12] = {0};
@@ -2219,6 +2436,7 @@ bool run_command(const char *cmd)
     const int got = sscanf(cmd, "%11s %11s %d", verb, arg, &n);
     if (got < 1) return false;
 
+    if (!strcmp(verb, "ping")) return true;   // answers once the UI is up
     if (!strcmp(verb, "shot")) {
         lv_refr_now(nullptr);
         send_screenshot();
@@ -2262,9 +2480,7 @@ bool run_command(const char *cmd)
     if (!strcmp(verb, "demo") && got >= 2) {
         DeviceState s = demo_base();
         if (!strcmp(arg, "off")) {
-            ui.demo = false;
-            ui.last_dev_version = 0xFFFFFFFF;   // back to the real scan results
-            load_attach();   // undo any "set attach"
+            demo_off();
         } else if (!strcmp(arg, "idle")) {
             ui.demo = true;
         } else if (!strcmp(arg, "loaded")) {
@@ -2318,6 +2534,7 @@ bool ui_command(const char *cmd)
 {
     LvLock lock;
     ui.last_input_ms = millis();   // someone is at the other end: stay on
+    ui.last_cmd_ms = millis();
     const bool ok = run_command(cmd);
     if (!ok) Serial.printf("\nERR %s\n", cmd);
     else if (strncmp(cmd, "shot", 4)) Serial.print("\nOK\n");
@@ -2337,7 +2554,7 @@ void ui_init()
     lv_scr_load(ui.scr_main);
     load_attach();
     ui.last_input_ms = millis();
-    ui.st = VClient::instance().state();
+    ui.st = vc().state();
     ui.last_load_refused = ui.st.load_refused;
     refresh_main();
     lv_timer_create(poll_cb, 25, nullptr);

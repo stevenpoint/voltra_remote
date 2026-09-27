@@ -31,7 +31,7 @@ void setup()
 
     // The client must come up before the UI: ui_init() reads the current device
     // state, and Client::begin() is what creates the mutex guarding it.
-    voltra::Client::instance().begin();
+    for (int i = 0; i < voltra::Client::COUNT; i++) voltra::Client::instance(i).begin();
 
     {
         LvLock lock;

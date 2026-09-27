@@ -91,11 +91,21 @@ struct DeviceState {
     const char *accessory_unit() const { return accessory_lb() ? "lb" : "%"; }
 };
 
+/**
+ * One Voltra connection. There are two (Client::COUNT), so the watch can hold two Voltras
+ * at once and switch between them; each has its own saved device and worker task. Slot 0
+ * also owns the scan behind the connect screen.
+ */
 class Client {
 public:
-    static Client &instance();
+    static constexpr int COUNT = 2;
+    static Client &instance(int slot = 0);
+    int slot() const { return slot_; }
 
-    /** Initialise NimBLE and start the worker task. Auto-connects to the saved device if any. */
+    /**
+     * Start the worker task, not connected: the user connects from the connect screen.
+     * Slot 0 first: it initialises NimBLE.
+     */
     void begin();
 
     // --- requests (safe from any task) ---------------------------------------
@@ -133,6 +143,24 @@ public:
     void twinWith(const FoundDevice &follower);
     /** Un-twin: tell the host to drop its follower. */
     void untwin();
+    /**
+     * Twin over this existing connection: tell this Voltra to join `host_addr` as its
+     * follower. It drops the link to go and join; this client then stays paused.
+     */
+    void joinHost(const std::string &host_addr);
+    /** Let go of the saved device for now, without forgetting it (it follows a twin). */
+    void pause();
+    /** Reconnect to the saved device after pause(). */
+    void resume();
+    bool paused() const { return paused_.load(); }
+    /** Read the twin status now rather than at the next poll. */
+    void pollTwin();
+    /**
+     * Whether this Voltra hosts a twin, as the UI works it out. Only then do loads use the
+     * twin commands: a follower (or one just out of a twin) reports "twinned" too, and a
+     * twin load sent to it does nothing.
+     */
+    void setTwinHost(bool host) { twin_host_ = host; }
 
     // --- state --------------------------------------------------------------
     DeviceState state() const;
@@ -141,6 +169,9 @@ public:
     uint32_t devicesVersion() const { return devices_version_.load(std::memory_order_relaxed); }
     bool hasSavedDevice() const { return !saved_addr_.empty(); }
     std::string savedDeviceName() const;
+    std::string savedAddress() const;
+    /** The saved device as a scan result would give it (empty address when none). */
+    FoundDevice savedDevice() const;
 
     // internal (public for the static callbacks)
     void onScanResult(const std::string &name, const std::string &addr, uint8_t addr_type, int rssi, bool is_voltra);
@@ -153,6 +184,12 @@ public:
 
 private:
     Client() = default;
+    int slot_ = 0;
+    std::atomic<bool> paused_{false};
+    std::atomic<bool> twin_host_{true};   // a single Voltra: hosts whatever twin it reports
+    bool joining_ = false;   // told to join a host: its dropping the link is expected
+    /** NVS key for this slot: "addr" for slot 0, "addr1" for slot 1. */
+    std::string key(const char *base) const;
 
     struct Requests {
         bool scan_start = false;
@@ -166,6 +203,11 @@ private:
         bool load_override = false;
         bool twin = false;
         bool untwin = false;
+        bool join = false;
+        bool pause = false;
+        bool resume = false;
+        bool twin_poll = false;
+        std::string join_host;
         FoundDevice twin_target;
         bool has_weight = false;
         bool has_chains = false;

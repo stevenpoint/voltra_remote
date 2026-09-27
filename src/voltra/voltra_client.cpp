@@ -147,24 +147,32 @@ class ScanCb : public NimBLEScanCallbacks {
 };
 
 class ClientCb : public NimBLEClientCallbacks {
+public:
+    Client *owner = nullptr;
+
+private:
     void onConnect(NimBLEClient *) override { log_i("GATT connected"); }
     void onConnectFail(NimBLEClient *, int reason) override { log_w("connect failed, reason %d", reason); }
-    void onDisconnect(NimBLEClient *, int reason) override { Client::instance().onDisconnected(reason); }
+    void onDisconnect(NimBLEClient *, int reason) override { owner->onDisconnected(reason); }
 };
 
 /** The short second connection used to twin (Client::joinFollower). Its disconnect must
  *  not look like the main link dropping. */
 class AuxClientCb : public NimBLEClientCallbacks {
+public:
+    Client *owner = nullptr;
+
+private:
     void onDisconnect(NimBLEClient *, int reason) override
     {
         log_i("twin: follower link closed, reason %d", reason);
-        Client::instance().onAuxDisconnected();
+        owner->onAuxDisconnected();
     }
 };
 
 ScanCb s_scan_cb;
-ClientCb s_client_cb;
-AuxClientCb s_aux_cb;
+ClientCb s_client_cb[Client::COUNT];
+AuxClientCb s_aux_cb[Client::COUNT];
 
 /** "80:b5:4e:07:02:a6" -> bytes in printed order, as the twin commands carry them. */
 bool parse_addr(const std::string &s, uint8_t out[6])
@@ -175,16 +183,26 @@ bool parse_addr(const std::string &s, uint8_t out[6])
     return true;
 }
 
-void task_entry(void *) { Client::instance().task(); }
+void task_entry(void *arg) { static_cast<Client *>(arg)->task(); }
 
 int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 }  // namespace
 
-Client &Client::instance()
+Client &Client::instance(int slot)
 {
-    static Client c;
-    return c;
+    static Client clients[COUNT];
+    static const bool numbered = [] {
+        for (int i = 0; i < COUNT; i++) clients[i].slot_ = i;
+        return true;
+    }();
+    (void)numbered;
+    return clients[slot >= 0 && slot < COUNT ? slot : 0];
+}
+
+std::string Client::key(const char *base) const
+{
+    return slot_ == 0 ? std::string(base) : std::string(base) + std::to_string(slot_);
 }
 
 // Null-safe so that reading state before begin() returns defaults instead of
@@ -204,7 +222,7 @@ void Client::unlockState() const
 bool Client::isTwinned() const
 {
     lockState();
-    const bool t = state_.twinned();
+    const bool t = state_.twinned() && twin_host_;
     unlockState();
     return t;
 }
@@ -229,6 +247,38 @@ void Client::untwin()
     lockState();
     req_.untwin = true;
     req_.twin = false;
+    unlockState();
+}
+
+void Client::joinHost(const std::string &host_addr)
+{
+    lockState();
+    req_.join = true;
+    req_.join_host = host_addr;
+    unlockState();
+}
+
+void Client::pause()
+{
+    paused_ = true;
+    lockState();
+    req_.pause = true;
+    req_.resume = false;
+    unlockState();
+}
+
+void Client::resume()
+{
+    lockState();
+    req_.resume = true;
+    req_.pause = false;
+    unlockState();
+}
+
+void Client::pollTwin()
+{
+    lockState();
+    req_.twin_poll = true;
     unlockState();
 }
 
@@ -263,7 +313,8 @@ bool Client::joinFollower(const FoundDevice &follower, const std::string &host_a
     if (!parse_addr(host_addr, host)) return false;
     NimBLEClient *c = NimBLEDevice::createClient();
     if (!c) return false;
-    c->setClientCallbacks(&s_aux_cb, false);
+    s_aux_cb[slot_].owner = this;
+    c->setClientCallbacks(&s_aux_cb[slot_], false);
     c->setConnectTimeout(8000);
     aux_disconnected_ = false;
     aux_link_reply_ = -1;
@@ -290,8 +341,8 @@ bool Client::joinFollower(const FoundDevice &follower, const std::string &host_a
             NimBLERemoteCharacteristic *ch = svc->getCharacteristic(NimBLEUUID(uuids[slot]));
             if (ch && ch->canNotify()) {
                 ch->subscribe(true,
-                    [slot](NimBLERemoteCharacteristic *, uint8_t *data, size_t len, bool) {
-                        Client::instance().onAuxNotify(slot, data, len);
+                    [this, slot](NimBLERemoteCharacteristic *, uint8_t *data, size_t len, bool) {
+                        onAuxNotify(slot, data, len);
                     }, true);
             }
         }
@@ -358,9 +409,9 @@ void Client::loadSaved()
 {
     Preferences p;
     if (p.begin("voltra", true)) {
-        saved_addr_ = p.getString("addr", "").c_str();
-        saved_type_ = p.getUChar("type", 0);
-        saved_name_ = p.getString("name", "").c_str();
+        saved_addr_ = p.getString(key("addr").c_str(), "").c_str();
+        saved_type_ = p.getUChar(key("type").c_str(), 0);
+        saved_name_ = p.getString(key("name").c_str(), "").c_str();
         p.end();
     }
 }
@@ -372,9 +423,9 @@ void Client::saveDevice(const std::string &addr, uint8_t type, const std::string
     saved_name_ = name;
     Preferences p;
     if (p.begin("voltra", false)) {
-        p.putString("addr", addr.c_str());
-        p.putUChar("type", type);
-        p.putString("name", name.c_str());
+        p.putString(key("addr").c_str(), addr.c_str());
+        p.putUChar(key("type").c_str(), type);
+        p.putString(key("name").c_str(), name.c_str());
         p.end();
     }
 }
@@ -387,9 +438,31 @@ void Client::forgetSavedDevice()
     unlockState();
     Preferences p;
     if (p.begin("voltra", false)) {
-        p.clear();
+        // only this slot's keys: the namespace holds both
+        p.remove(key("addr").c_str());
+        p.remove(key("type").c_str());
+        p.remove(key("name").c_str());
         p.end();
     }
+}
+
+FoundDevice Client::savedDevice() const
+{
+    FoundDevice d;
+    lockState();
+    d.address = saved_addr_;
+    d.addr_type = saved_type_;
+    d.name = saved_name_.empty() ? saved_addr_ : saved_name_;
+    unlockState();
+    return d;
+}
+
+std::string Client::savedAddress() const
+{
+    lockState();
+    std::string a = saved_addr_;
+    unlockState();
+    return a;
 }
 
 std::string Client::savedDeviceName() const
@@ -407,37 +480,31 @@ void Client::begin()
 {
     mutex_ = xSemaphoreCreateMutex();
     loadSaved();
-
-    NimBLEDevice::init(APP_NAME);
-    NimBLEDevice::setMTU(PREFERRED_MTU);
-    NimBLEDevice::setPower(9);
-
-    NimBLEScan *scan = NimBLEDevice::getScan();
-    scan->setScanCallbacks(&s_scan_cb, false);
-    scan->setActiveScan(true);
-    scan->setInterval(45);
-    scan->setWindow(30);
-    scan->setMaxResults(0);
-
-    if (!saved_addr_.empty()) {
-        target_addr_ = saved_addr_;
-        target_type_ = saved_type_;
-        target_name_ = saved_name_;
-        auto_reconnect_ = true;
-        reconnect_delay_ms_ = RECONNECT_MIN_MS;
-        reconnect_at_ms_ = millis() + 500;
-        lockState();
-        state_.conn = ConnState::Reconnecting;
-        strncpy(state_.device_name, target_name_.c_str(), sizeof(state_.device_name) - 1);
-        strncpy(state_.address, target_addr_.c_str(), sizeof(state_.address) - 1);
-        snprintf(state_.status, sizeof(state_.status), "Connecting to %s", target_name_.c_str());
-        bump();
-        unlockState();
-    } else {
-        setStatus("Tap to connect");
+    // One Voltra in two slots would have both fighting over it: slot 0 keeps it.
+    if (slot_ != 0 && !saved_addr_.empty() && saved_addr_ == instance(0).savedAddress()) {
+        forgetSavedDevice();
     }
 
-    xTaskCreatePinnedToCore(task_entry, "voltra", 8192, nullptr, 3, nullptr, 0);
+    if (slot_ == 0) {
+        NimBLEDevice::init(APP_NAME);
+        NimBLEDevice::setMTU(PREFERRED_MTU);
+        NimBLEDevice::setPower(9);
+
+        NimBLEScan *scan = NimBLEDevice::getScan();
+        scan->setScanCallbacks(&s_scan_cb, false);
+        scan->setActiveScan(true);
+        // A third of the radio time: the connections (up to two, and the twin's host
+        // serving its follower) need the rest.
+        scan->setInterval(90);
+        scan->setWindow(30);
+        scan->setMaxResults(0);
+    }
+
+    // Nothing connects on its own at start-up: the user picks the Voltra(s) each time on
+    // the connect screen. (Within a session a dropped link is still retried.)
+    setStatus("Tap to connect");
+
+    xTaskCreatePinnedToCore(task_entry, slot_ == 0 ? "voltra" : "voltra2", 8192, this, 3, nullptr, 0);
 }
 
 void Client::scanStart()
@@ -592,7 +659,8 @@ bool Client::takeRequests(Requests &out)
     req_ = Requests();
     unlockState();
     return out.scan_start || out.scan_stop || out.connect || out.disconnect || out.refresh || out.load ||
-           out.unload || out.auto_load || out.load_override || out.twin || out.untwin || out.has_weight || out.has_chains || out.has_eccentric ||
+           out.unload || out.auto_load || out.load_override || out.twin || out.untwin || out.join ||
+           out.pause || out.resume || out.twin_poll || out.has_weight || out.has_chains || out.has_eccentric ||
            out.has_inverse || out.has_mountain;
 }
 
@@ -973,6 +1041,7 @@ bool Client::writeNext()
 
 void Client::startScan()
 {
+    if (slot_ != 0) return;   // slot 0 runs the scan
     NimBLEScan *scan = NimBLEDevice::getScan();
     if (scan->isScanning()) return;
     scan->clearResults();
@@ -1024,9 +1093,12 @@ bool Client::doConnect(const std::string &addr, uint8_t addr_type)
 {
     NimBLEClient *c = NimBLEDevice::createClient();
     if (!c) return false;
-    c->setClientCallbacks(&s_client_cb, false);
+    s_client_cb[slot_].owner = this;
+    c->setClientCallbacks(&s_client_cb[slot_], false);
     c->setConnectTimeout(10000);
-    c->setConnectionParams(12, 24, 0, 400);
+    // Supervision timeout 10 s (units of 10 ms): a Voltra hosting a twin is also serving
+    // the follower, and one that drops us stops advertising, so ride out quiet spells.
+    c->setConnectionParams(12, 24, 0, 1000);
 
     NimBLEAddress address(addr, addr_type);
     log_i("connecting to %s", addr.c_str());
@@ -1064,8 +1136,8 @@ bool Client::doConnect(const std::string &addr, uint8_t addr_type)
         NimBLERemoteCharacteristic *ch = svc->getCharacteristic(NimBLEUUID(uuids[slot]));
         if (ch && ch->canNotify()) {
             bool ok = ch->subscribe(true,
-                [slot](NimBLERemoteCharacteristic *, uint8_t *data, size_t len, bool) {
-                    Client::instance().onNotify(slot, data, len);
+                [this, slot](NimBLERemoteCharacteristic *, uint8_t *data, size_t len, bool) {
+                    onNotify(slot, data, len);
                 }, true);
             log_i("subscribe %s: %s", uuids[slot], ok ? "ok" : "failed");
             (void)ok;   // only logged
@@ -1111,9 +1183,31 @@ void Client::task()
             unlockState();
         }
 
+        if (r.pause) {
+            // Let go of the saved device for now (it follows a twin), without forgetting it.
+            auto_reconnect_ = false;
+            joining_ = false;
+            teardown();
+            lockState();
+            state_.conn = ConnState::Idle;
+            snprintf(state_.status, sizeof(state_.status), "In the twin");
+            bump();
+            unlockState();
+        }
+        if (r.resume && !saved_addr_.empty() && !client_) {
+            paused_ = false;
+            auto_reconnect_ = true;
+            target_addr_ = saved_addr_;
+            target_type_ = saved_type_;
+            target_name_ = saved_name_;
+            reconnect_delay_ms_ = RECONNECT_MIN_MS;
+            reconnect_at_ms_ = now;
+        }
+
         if (r.connect) {
             if (client_) teardown();
             stopScan();
+            paused_ = false;
             auto_reconnect_ = true;
             target_addr_ = r.target.address;
             target_type_ = r.target.addr_type;
@@ -1144,8 +1238,18 @@ void Client::task()
         if (disconnected_flag_) {
             disconnected_flag_ = false;
             teardown();
+            if (joining_) {
+                // Told to join a host: it dropped this link to go and do so.
+                log_i("twin: %s left to join the host", target_addr_.c_str());
+                joining_ = false;
+                auto_reconnect_ = false;
+                paused_ = true;
+            }
             lockState();
-            if (auto_reconnect_ && !target_addr_.empty()) {
+            if (joining_ || paused_) {
+                state_.conn = ConnState::Idle;
+                snprintf(state_.status, sizeof(state_.status), "In the twin");
+            } else if (auto_reconnect_ && !target_addr_.empty()) {
                 state_.conn = ConnState::Reconnecting;
                 snprintf(state_.status, sizeof(state_.status), "Reconnecting");
                 reconnect_at_ms_ = now + reconnect_delay_ms_;
@@ -1240,6 +1344,8 @@ void Client::task()
             }
             if (r.load) {
                 DeviceState s = state();
+                log_i("[%d] load: mode %d, workout state %d, status %d, twin %d -> write %04x", slot_,
+                      s.fitness_mode, s.workout_state, s.workout_status, s.twin_state, loadModeValue(true));
                 if (s.workout_state <= WORKOUT_STATE_INACTIVE) {
                     queueParamWriteU8(PARAM_FITNESS_WORKOUT_STATE, WORKOUT_STATE_ACTIVE);
                 }
@@ -1299,6 +1405,22 @@ void Client::task()
                     queueTwinStatusRead();
                 } else {
                     log_w("twin: un-twin requested but no follower known");
+                }
+            }
+            if (r.twin_poll) {
+                queueTwinStatusRead();
+                last_twin_poll_ms_ = now;
+            }
+            if (r.join) {
+                uint8_t host[7] = {TWIN_LINK_JOIN};
+                if (parse_addr(r.join_host, host + 1)) {
+                    log_i("twin: asking %s to join %s", target_addr_.c_str(), r.join_host.c_str());
+                    uint8_t buf[32];
+                    enqueue(buf, build_frame(buf, sizeof(buf), CMD_TWIN_LINK, host, sizeof(host), nextSeq()));
+                    joining_ = true;
+                    setStatus("Joining the twin");
+                } else {
+                    log_w("twin: bad host address %s", r.join_host.c_str());
                 }
             }
             if (r.twin) {
@@ -1459,7 +1581,7 @@ void Client::task()
             }
             if (conn == ConnState::Ready && queueDepth() <= 1 && now - last_refresh_ms_ >= STATE_REFRESH_MS) {
                 const DeviceState s = state();
-                if (s.twinned() && s.loaded()) {
+                if (isTwinned() && s.loaded()) {
                     // Beyond+ repeats this every 0.5 s while the twin is loaded.
                     const uint8_t refresh[] = {VENDOR_STATE_REFRESH, 0x01};
                     uint8_t buf[32];
