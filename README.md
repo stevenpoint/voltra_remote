@@ -36,7 +36,8 @@ Screenshots come straight off the watch (`tools/screenshot.py`).
 | Swipe up / down | Weight +/- 1 lb, 5 lb steps when swiping fast |
 | Gear button | Settings: attachment, eccentric, chains, inverse chains, mountain |
 | Tap an accessory dial under the weight | Adjust that accessory |
-| Tap the Bluetooth bar at the top | Connect screen: pick a Voltra, twin, un-twin |
+| Tap the Bluetooth bar at the top | Connect screen: connect one or two Voltras, pair, un-twin |
+| Two Voltras connected: tap the other one in the top bar | Control that Voltra |
 
 The rail around the screen edge shows the weight: white while unloaded, green while loaded.
 With eccentric on, the weight follows each rep: the base weight on the pull, and base
@@ -117,8 +118,13 @@ The watch charges the battery over USB-C. Its level shows at the bottom of the s
 2. On the watch, tap the Bluetooth bar at the top to open the Connect screen.
 3. Tap your Voltra (`VTR-...`) in the list.
 
-The watch remembers it and reconnects by itself next time. The watch never loads the
-Voltra on its own: at start-up it only connects.
+The watch starts up unconnected each time: connect from the Connect screen when you want
+to. If the link drops during a session, it reconnects by itself. It never loads the Voltra
+on its own.
+
+To use two Voltras, connect the second from the Connect screen too. The top bar then shows
+both; tap the other one to control it. Each keeps its own weight, accessories and
+attachment.
 
 ## Twin mode
 
@@ -126,11 +132,15 @@ Twin the Voltras **from the watch**, not from the Voltras' own screens: a hostin
 stops advertising, so a remote can only drive the pair over a connection it made before
 twinning (the way Beyond+ does it; see `docs/PROTOCOL.md`, "Twin mode").
 
-1. Connect to the Voltra that should host.
-2. Open the Connect screen and tap **Twin with VTR-...** under the other Voltra.
-3. The top bar shows **TWIN** and both Voltras' batteries (host first); weight, load,
+1. Connect to the Voltra that should host (the one you are controlling, if both are
+   connected).
+2. Open the Connect screen and tap **Pair VTR-... + VTR-...** (both connected) or
+   **Twin with VTR-...** under the other Voltra. With both connected, the watch lets go of
+   the other first: a Voltra will not join a twin while the watch is connected to it.
+3. The watch goes back to the main screen, and the top bar shows **TWIN** and both Voltras' batteries (host first); weight, load,
    unload and the cable-out override now drive both, and the weight shows the pair's total.
-4. **Un-twin** on the Connect screen undoes it.
+4. **Un-twin** on the Connect screen undoes it. If both were connected before pairing, the
+   watch reconnects to the second by itself.
 
 If the watch loses the host while twinned it keeps retrying; reconnecting can take a
 minute or so, and if it does not, un-twin on the Voltras and set the twin up again.

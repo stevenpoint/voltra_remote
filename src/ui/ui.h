@@ -10,6 +10,8 @@ void ui_init();
  *   show main|settings|ecc|chains|attach|connect
  *   demo off|idle|loaded|set|ecc|twin   stand-in Voltra state (off: back to the real one)
  *   demo devs                two stand-in Voltras in range, for the connect screen
+ *   ping                     just OK, once the UI is up
+ * The stand-in lapses two minutes after the last command.
  *   set ecc|chains|attach|weight|reps N  adjust the stand-in state
  */
 bool ui_command(const char *cmd);
