@@ -3,7 +3,7 @@
 #
 #   irm https://raw.githubusercontent.com/stevenpoint/voltra_remote/watch206/tools/install_knob.ps1 | iex
 #
-# Installs Python (with winget) if it is missing, and PlatformIO in a folder of its own
+# Installs Python and Git (with winget) if they are missing, and PlatformIO in a folder of its own
 # (%USERPROFILE%\voltra_remote_tools). Safe to run again: it fetches the latest code each time.
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +63,30 @@ if (-not (Test-Path $VenvPy)) {
 & $VenvPy -m pip install --quiet --upgrade platformio pyserial
 if ($LASTEXITCODE -ne 0) { Fail 'Could not install PlatformIO. Check the internet connection and run this again.' }
 Write-Host 'Python and PlatformIO ready.'
+
+# --- Git: the ESP32 platform will not build without it on PATH ----------------------------
+Step 'Checking for Git'
+function Add-GitPath {
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [Environment]::GetEnvironmentVariable('Path', 'User')
+    foreach ($d in @("$env:ProgramFiles\Git\cmd", "$env:LOCALAPPDATA\Programs\Git\cmd")) {
+        if ((Test-Path "$d\git.exe") -and ($env:Path -notlike "*$d*")) { $env:Path = "$d;$env:Path" }
+    }
+}
+Add-GitPath
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Fail ("Git is not installed and winget is not available to install it.`n" +
+              "Install Git from https://git-scm.com/download/win, then run this again.")
+    }
+    Write-Host 'Installing Git (a few minutes; Windows may ask for permission)...'
+    winget install -e --id Git.Git --silent --accept-source-agreements --accept-package-agreements
+    Add-GitPath
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Fail 'Git installed, but this window cannot see it yet. Close PowerShell, open a new one and run this again.'
+    }
+}
+Write-Host 'Git ready.'
 
 # --- 2. Code -----------------------------------------------------------------------------
 Step 'Downloading the latest code'

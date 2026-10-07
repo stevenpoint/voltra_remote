@@ -160,7 +160,7 @@ watch: 1 lb steps turned slowly, 5 lb steps spun fast. The knob keeps the origin
 remote's screen layout. The Voltra code is the same on both, so twin mode, two Voltras
 at once and the Connect screen work there too: tap the top of the screen to open it.
 
-On Windows, one command in PowerShell installs what it needs (Python, PlatformIO), downloads
+On Windows, one command in PowerShell installs what it needs (Python, Git, PlatformIO), downloads
 the code, flashes the knob and offers to take screenshots of every screen:
 
 ```
