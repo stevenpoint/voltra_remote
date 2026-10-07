@@ -10,6 +10,7 @@ and recolour them like text.
   U+E003  mountain        a peak with a smaller one in front of its left flank
   U+E004  settings        five dots in a plus (the Voltra's settings button)
   U+E005  attachment      a barbell seen side on: a bar through two plates each end
+  U+E006  pulley          a wheel on a hook, the cable running down both sides
 
 Shapes are drawn in their own design units at high resolution, then box-filtered
 down to the target size. Needs Pillow.
@@ -128,6 +129,17 @@ def draw_attachment(draw, s):
                                    radius=10 * s, fill=255)
 
 
+def draw_pulley(draw, s):
+    r, t = 100, 50   # wheel radius to the middle of its rim, rim width
+    # the hook it hangs from, then the wheel with its axle
+    draw.rectangle([-24 * s, (-r - 80) * s, 24 * s, -r * s], fill=255)
+    ring_arc(draw, 0, 0, r, r, t, 0, 360, s)
+    draw.ellipse([-32 * s, -32 * s, 32 * s, 32 * s], fill=255)
+    # the cable over the wheel and down both sides
+    for sx in (-1, 1):
+        draw.rectangle([(sx * r - t / 2) * s, 0, (sx * r + t / 2) * s, 230 * s], fill=255)
+
+
 # (label, draw function, max width px, max height px) at the 26 px design size; other
 # sizes scale these
 ICONS = [
@@ -137,6 +149,7 @@ ICONS = [
     ("mountain", draw_mountain, 27, 16),
     ("settings", draw_settings, 24, 24),
     ("attachment", draw_attachment, 27, 18),
+    ("pulley", draw_pulley, 22, 24),
 ]
 
 

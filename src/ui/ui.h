@@ -13,5 +13,6 @@ void ui_init();
  *   ping                     just OK, once the UI is up
  * The stand-in lapses two minutes after the last command.
  *   set ecc|chains|attach|weight|reps N  adjust the stand-in state
+ *   set pulley 1|2|0.5       the pulley ratio, until "demo off"
  */
 bool ui_command(const char *cmd);

@@ -34,7 +34,7 @@ Screenshots come straight off the watch (`tools/screenshot.py`).
 | Hold the weight | Voltra auto load (pull and hold the cable, 3 s countdown) |
 | Tap again on "CABLE OUT: TAP TO OVERRIDE" | Load at once with the cable pulled out |
 | Swipe up / down | Weight +/- 1 lb, 5 lb steps when swiping fast |
-| Gear button | Settings: attachment, eccentric, chains, inverse chains, mountain |
+| Gear button | Settings: attachment, eccentric, chains, inverse chains, mountain, pulley |
 | Tap an accessory dial under the weight | Adjust that accessory |
 | Tap the Bluetooth bar at the top | Connect screen: connect one or two Voltras, pair, un-twin |
 | Two Voltras connected: tap the other one in the top bar | Control that Voltra |
@@ -47,6 +47,12 @@ length). The line under the weight says which.
 **Attachment** (0 to 50 lb) is the weight of whatever hangs on the cable, such as a bar. It
 is added to the weight on screen but never sent to the Voltra: with a 50 lb attachment and
 the Voltra at 30 lb, the screen shows 80 lb. It is remembered across restarts.
+
+**Pulley** (1:1, 2:1 or 0.5:1; tap the row to step through them) is for a pulley between
+the Voltra and the handle. It is also display only: at 2:1 the weight, the live force and
+the eccentric on the way back show what the handle carries, twice the Voltra's, and the
+ratio shows over the unit. 0.5:1 halves them. The Voltra is still sent its own weight.
+One setting for both Voltras, remembered across restarts.
 
 The watch switches itself off after 10 minutes without a touch, unless the Voltra is
 loaded or the watch is plugged in. The side button turns it back on.

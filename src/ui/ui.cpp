@@ -35,6 +35,7 @@ namespace {
 #define C_MUTED    lv_color_hex(0x94a3b8)
 #define C_UNLOADED lv_color_hex(0x3b82f6)
 #define C_LOADED   lv_color_hex(0xbefa3c)
+#define C_LOADED_HEX "befa3c"
 // Unloaded, as on the Voltra: the weight in a muted green and the ring in grey.
 #define C_IDLE_NUM  lv_color_hex(0x283308)
 #define C_IDLE_RING lv_color_hex(0x6b7280)
@@ -53,6 +54,7 @@ namespace {
 #define ICON_MOUNTAIN  "\xEE\x80\x83"   // U+E003
 #define ICON_SETTINGS  "\xEE\x80\x84"   // U+E004
 #define ICON_ATTACH    "\xEE\x80\x85"   // U+E005
+#define ICON_PULLEY    "\xEE\x80\x86"   // U+E006
 #define C_ATTACH   lv_color_hex(0x38bdf8)
 #define C_ATTACH_HEX "38bdf8"
 
@@ -72,6 +74,10 @@ constexpr uint32_t AUTO_LOAD_PENDING_MS = 4000;
 constexpr uint32_t POWER_OFF_IDLE_MS = 10 * 60 * 1000;
 // Attachment (bar, handle...) weight added to the displayed weight, never sent to the Voltra.
 constexpr int MAX_ATTACH_LB = 50;
+// A pulley between the Voltra and the handle, display only: at 2:1 the handle carries twice
+// the Voltra's weight, 0.5:1 halves it. The Voltra is always sent its own weight. Kept as
+// twice the ratio so 0.5:1 is whole, in the order a tap on its settings row steps through.
+constexpr int PULLEY_X2[] = {2, 4, 1};   // 1:1, 2:1, 0.5:1
 // A stand-in Voltra (serial "demo") left on by mistake would hide the real one, so it
 // lapses this long after the last serial command.
 constexpr uint32_t DEMO_TIMEOUT_MS = 2 * 60 * 1000;
@@ -94,6 +100,7 @@ enum SettingsRow : intptr_t {
     ROW_ECCENTRIC,
     ROW_MOUNTAIN,
     ROW_ATTACH,
+    ROW_PULLEY,
     ROW_CLOSE,
 };
 
@@ -148,7 +155,7 @@ struct Ui {
         lv_obj_t *title = nullptr;
         lv_obj_t *value = nullptr;
     };
-    Bubble bub_ecc, bub_chains, bub_mountain, bub_inverse, bub_attach;
+    Bubble bub_ecc, bub_chains, bub_mountain, bub_inverse, bub_attach, bub_pulley;
     lv_obj_t *btn_settings_done = nullptr;
 
     // eccentric / chains / attachment (watch): the amount, a slider and quick picks
@@ -185,6 +192,7 @@ struct Ui {
     int chains = 0;            // shared by chains, inverse chains and mountain
     int ecc = 0;
     int attach = 0;            // attachment lb, kept on this device only (NVS)
+    int pulley_x2 = 2;         // twice the pulley ratio (PULLEY_X2), kept on this device (NVS)
     int last_display = -2;     // Voltra lb/% setting the values above were taken in
     ChainStyle style = ChainStyle::Chains;       // what the amount currently drives
     ChainStyle adj_style = ChainStyle::Chains;   // which style the dial screen edits
@@ -271,6 +279,21 @@ int amount_pct(int v)
     return (v * 100 + (v >= 0 ? ui.weight / 2 : -ui.weight / 2)) / ui.weight;
 }
 int amount_lb(int v) { return lb_mode() ? v : pct_to_lb(v); }
+
+/** Pounds at the handle, through the pulley, doubled: 0.5:1 can make a half. */
+int handle_x2(int lb) { return lb * ui.pulley_x2; }
+
+/** Pounds from twice them: "75", "37.5", "+7.5". */
+void format_x2(char *buf, size_t n, int x2, bool signed_value)
+{
+    const char *sign = x2 < 0 ? "-" : (signed_value && x2 > 0 ? "+" : "");
+    const int a = std::abs(x2);
+    if (a % 2) snprintf(buf, n, "%s%d.5", sign, a / 2);
+    else snprintf(buf, n, "%s%d", sign, a / 2);
+}
+
+bool pulley_on() { return ui.pulley_x2 != 2; }
+const char *pulley_label() { return ui.pulley_x2 == 4 ? "2:1" : ui.pulley_x2 == 1 ? "0.5:1" : "1:1"; }
 
 // Limits are percentages on the device; in pound mode they apply to the current base weight.
 int chains_max() { return lb_mode() ? pct_to_lb(ui.st.max_chains_pct) : ui.st.max_chains_pct; }
@@ -817,6 +840,27 @@ void save_attach()
     p.end();
 }
 
+/** The pulley is one setting for both Voltras: it is on the cable, not the Voltra. */
+void load_pulley()
+{
+    ui.pulley_x2 = 2;
+    Preferences p;
+    if (!p.begin(PRESET_NS, true)) return;
+    const int v = p.getUChar("pulley", 2);
+    p.end();
+    for (int r : PULLEY_X2) {
+        if (r == v) ui.pulley_x2 = v;
+    }
+}
+
+void save_pulley()
+{
+    Preferences p;
+    if (!p.begin(PRESET_NS, false)) return;
+    if (p.getUChar("pulley", 2) != ui.pulley_x2) p.putUChar("pulley", (uint8_t)ui.pulley_x2);
+    p.end();
+}
+
 /** Put the other Voltra on screen. Edits not yet sent go to the one being left. */
 void switch_to(int slot)
 {
@@ -913,6 +957,7 @@ void on_preset_hold(lv_event_t *e)
 // the weight, a line under it (what makes up the weight, or the rep phase), and the dock
 // of chips at the bottom, where the set and rep counts go during a set.
 #define L_WEIGHT_FONT font_poppins_160
+#define L_WEIGHT_FONT_SMALL font_poppins_120   // when a half pound or the ratio makes it too wide
 #define L_STATE_FONT font_poppins_20
 #define L_REPS_FONT font_poppins_16
 #define L_IDLE_NUM lv_color_hex(0xe2e8f0)   // unloaded: light enough to read
@@ -930,6 +975,7 @@ constexpr int L_DOCK_Y = 151;
 constexpr int L_COUNT_X = 77, L_COUNT_CAP_Y = 104, L_COUNT_NUM_Y = 152;
 #else
 #define L_WEIGHT_FONT font_poppins_96
+#define L_WEIGHT_FONT_SMALL font_poppins_72
 #define L_STATE_FONT font_poppins_14
 #define L_REPS_FONT font_poppins_14
 #define L_IDLE_NUM C_IDLE_NUM
@@ -944,6 +990,31 @@ constexpr int L_REPS_Y = 50;
 constexpr int L_GEAR_Y = 114;
 constexpr int L_CHIP_X = 74, L_CHIP_Y = 96;
 #endif
+
+/**
+ * The weight at the handle, and its unit with the pulley's ratio over it when there is
+ * one. A size smaller when the row would be wider than the weight's touch target.
+ */
+void set_weight_text(int x2)
+{
+    char num[12], unit[32];
+    format_x2(num, sizeof(num), x2, false);
+    if (pulley_on()) snprintf(unit, sizeof(unit), "#" C_LOADED_HEX " %s#\n%s", pulley_label(), L_WEIGHT_UNIT);
+    else snprintf(unit, sizeof(unit), "%s", L_WEIGHT_UNIT);
+
+    const char *unit_line = pulley_on() ? pulley_label() : L_WEIGHT_UNIT;   // the wider line
+    const lv_coord_t unit_w = lv_txt_get_width(unit_line, strlen(unit_line), &font_poppins_22, 0, LV_TEXT_FLAG_NONE);
+    const lv_font_t *font = &L_WEIGHT_FONT;
+    if (lv_txt_get_width(num, strlen(num), font, 0, LV_TEXT_FLAG_NONE) + 6 + unit_w > L_CENTER_W) {
+        font = &L_WEIGHT_FONT_SMALL;
+    }
+    if (lv_obj_get_style_text_font(ui.lbl_weight, LV_PART_MAIN) != font) {
+        lv_obj_set_style_text_font(ui.lbl_weight, font, 0);
+        lv_obj_set_style_pad_bottom(ui.lbl_unit, font->base_line - 1, 0);   // as make_value_row
+    }
+    lv_label_set_text(ui.lbl_weight, num);
+    lv_label_set_text(ui.lbl_unit, unit);
+}
 
 void refresh_main()
 {
@@ -965,8 +1036,11 @@ void refresh_main()
     // The Voltra's weight is per unit; twinned, show the pair's total like its screen does.
     const int per_unit_x = st.twinned() ? 2 : 1;
     const int device_lb = (ui.weight + (ecc_phase ? amount_lb(ui.ecc) : 0)) * per_unit_x;
-    // The attachment's weight is added for display only.
-    lv_label_set_text_fmt(ui.lbl_weight, "%d", device_lb + ui.attach);
+    // At the handle: through the pulley, then the attachment, both for display only.
+    const int handle2 = handle_x2(device_lb);
+    set_weight_text(handle2 + 2 * ui.attach);
+    char handle[12];
+    format_x2(handle, sizeof(handle), handle2, false);
 
     lv_color_t ring = loaded ? C_LOADED : L_IDLE_GAUGE;
     if (!connected) ring = L_OFF_GAUGE;
@@ -1083,8 +1157,9 @@ void refresh_main()
     if (set_mode) {
 #ifdef WATCH206
         if (ui.shown_phase == 3 && ecc_phase) {
-            lv_label_set_text_fmt(ui.lbl_reps, LV_SYMBOL_DOWN "  Return    %+d eccentric",
-                                  amount_lb(ui.ecc) * per_unit_x);
+            char ecc[12];
+            format_x2(ecc, sizeof(ecc), handle_x2(amount_lb(ui.ecc) * per_unit_x), true);
+            lv_label_set_text_fmt(ui.lbl_reps, LV_SYMBOL_DOWN "  Return    %s eccentric", ecc);
         } else if (ui.shown_phase == 3) {
             lv_label_set_text(ui.lbl_reps, LV_SYMBOL_DOWN "  Return");
         } else if (ui.shown_phase == 1) {
@@ -1098,12 +1173,14 @@ void refresh_main()
     } else if (ready && loaded && (st.reps > 0 || st.sets > 0)) {
         lv_label_set_text_fmt(ui.lbl_reps, "SET %u   REP %u", (unsigned)st.sets, (unsigned)st.reps);
     } else if (ready && loaded && st.force_known) {
-        lv_label_set_text_fmt(ui.lbl_reps, "%d lb on cable", st.force_lb);
+        char force[12];
+        format_x2(force, sizeof(force), handle_x2(st.force_lb), false);
+        lv_label_set_text_fmt(ui.lbl_reps, "%s lb on cable", force);
     } else if (ui.attach > 0) {
 #ifdef WATCH206
-        lv_label_set_text_fmt(ui.lbl_reps, "%d Voltra  +  #" C_ATTACH_HEX " %d attachment#", device_lb, ui.attach);
+        lv_label_set_text_fmt(ui.lbl_reps, "%s Voltra  +  #" C_ATTACH_HEX " %d attachment#", handle, ui.attach);
 #else
-        lv_label_set_text_fmt(ui.lbl_reps, "Voltra %d lb  +  attachment %d lb", device_lb, ui.attach);
+        lv_label_set_text_fmt(ui.lbl_reps, "Voltra %s lb  +  attachment %d lb", handle, ui.attach);
 #endif
     } else {
         lv_label_set_text(ui.lbl_reps, "");
@@ -1399,6 +1476,7 @@ void build_main()
     lv_obj_add_event_cb(ui.btn_center, on_center_hold, LV_EVENT_LONG_PRESSED, nullptr);
     lv_obj_t *row = make_value_row(ui.btn_center, &L_WEIGHT_FONT, &ui.lbl_weight, &ui.lbl_unit);
     lv_label_set_text(ui.lbl_unit, L_WEIGHT_UNIT);
+    lv_label_set_recolor(ui.lbl_unit, true);   // the pulley's ratio, over the unit
     lv_obj_align(row, LV_ALIGN_CENTER, 0, L_ROW_Y);
     ui.lbl_state = make_label(ui.btn_center, &L_STATE_FONT, C_MUTED, "NOT CONNECTED");
 #ifdef WATCH206
@@ -1481,7 +1559,14 @@ void refresh_adjust()
         lv_arc_set_range(ui.arc_adj, 0, MAX_ATTACH_LB);
         lv_arc_set_value(ui.arc_adj, ui.attach);
         lv_label_set_text_fmt(ui.lbl_adj_val, "%d", ui.attach);
-        lv_label_set_text_fmt(ui.lbl_adj_range, "%d lb Voltra  =  %d lb total", base, base + ui.attach);
+        // Through a pulley the handle carries the Voltra's weight times its ratio.
+        char total[12];
+        format_x2(total, sizeof(total), handle_x2(base) + 2 * ui.attach, false);
+        if (pulley_on()) {
+            lv_label_set_text_fmt(ui.lbl_adj_range, "%d lb Voltra x %s  =  %s lb total", base, pulley_label(), total);
+        } else {
+            lv_label_set_text_fmt(ui.lbl_adj_range, "%d lb Voltra  =  %s lb total", base, total);
+        }
     } else if (chains) {
         int mx = chains_max();
         const int v = style_amount(ui.adj_style);
@@ -1590,6 +1675,16 @@ void on_settings_row(lv_event_t *e)
             show(Screen::AdjustAttach);
             refresh_adjust();
             break;
+        case ROW_PULLEY: {
+            // A tap steps 1:1 -> 2:1 -> 0.5:1 -> 1:1.
+            constexpr int n = sizeof(PULLEY_X2) / sizeof(PULLEY_X2[0]);
+            int i = 0;
+            while (i < n && PULLEY_X2[i] != ui.pulley_x2) i++;
+            ui.pulley_x2 = PULLEY_X2[(i + 1) % n];
+            save_pulley();
+            refresh_settings();
+            break;
+        }
         case ROW_CLOSE:
         default:
             show(Screen::Main);
@@ -1624,7 +1719,7 @@ void make_bubble(Ui::Bubble &b, lv_obj_t *list, const char *icon, lv_color_t col
 {
     b.btn = lv_btn_create(list);
     lv_obj_remove_style_all(b.btn);
-    lv_obj_set_size(b.btn, LV_PCT(100), 64);
+    lv_obj_set_size(b.btn, LV_PCT(100), 56);
     lv_obj_set_style_radius(b.btn, 20, 0);
     lv_obj_set_style_bg_color(b.btn, C_CARD, 0);
     lv_obj_set_style_bg_opa(b.btn, LV_OPA_COVER, 0);
@@ -1705,6 +1800,9 @@ void refresh_settings()
     if (ui.attach > 0) snprintf(buf, sizeof(buf), "%d lb", ui.attach);
     else snprintf(buf, sizeof(buf), "%s", SETTING_OFF);
     set_bubble(ui.bub_attach, buf, ui.attach > 0, C_ATTACH);
+
+    // Never off: 1:1 is muted, like an accessory that is off.
+    set_bubble(ui.bub_pulley, pulley_label(), pulley_on(), C_LOADED);
 }
 
 void build_settings()
@@ -1717,13 +1815,15 @@ void build_settings()
     lv_obj_set_size(list, 366, LV_SIZE_CONTENT);
     lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(list, 8, 0);
+    // Six rows of 56 end 50 px above the bottom, clear of the panel's rounded corners.
+    lv_obj_set_style_pad_row(list, 6, 0);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 86);
     make_bubble(ui.bub_attach,   list, ICON_ATTACH,    C_ATTACH, "Attachment",     ROW_ATTACH);
     make_bubble(ui.bub_ecc,      list, ICON_ECCENTRIC, C_ECC,    "Eccentric",      ROW_ECCENTRIC);
     make_bubble(ui.bub_chains,   list, ICON_CHAINS,    C_CHAINS, "Chains",         ROW_CHAINS);
     make_bubble(ui.bub_inverse,  list, ICON_INVERSE,   C_CHAINS, "Inverse chains", ROW_INVERSE);
     make_bubble(ui.bub_mountain, list, ICON_MOUNTAIN,  C_WARN,   "Mountain",       ROW_MOUNTAIN);
+    make_bubble(ui.bub_pulley,   list, ICON_PULLEY,    C_LOADED, "Pulley",         ROW_PULLEY);
 #else
     lv_obj_t *ring = make_ring(ui.scr_settings, C_TRACK);
     lv_arc_set_value(ring, 0);
@@ -1732,13 +1832,15 @@ void build_settings()
     lv_obj_set_style_text_letter_space(title, 2, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
 
-    // Three over two: eccentric, chains, inverse chains / mountain, attachment. Kept inside
-    // the ring: the farthest bubble edge is ~151 px from centre against the ring's 158 px.
+    // Three over three: eccentric, chains, inverse chains / mountain, attachment, pulley.
+    // Kept inside the ring: the farthest bubble edge is ~154 px from centre against the
+    // ring's 158 px.
     make_bubble(ui.bub_ecc,      ICON_ECCENTRIC, "Eccentric",  ROW_ECCENTRIC, -96, -42);
     make_bubble(ui.bub_chains,   ICON_CHAINS,    "Chains",     ROW_CHAINS,      0, -42);
     make_bubble(ui.bub_inverse,  ICON_INVERSE,   "Inverse",    ROW_INVERSE,    96, -42);
-    make_bubble(ui.bub_mountain, ICON_MOUNTAIN,  "Mountain",   ROW_MOUNTAIN,  -48,  54);
-    make_bubble(ui.bub_attach,   ICON_ATTACH,    "Attachment", ROW_ATTACH,     48,  54);
+    make_bubble(ui.bub_mountain, ICON_MOUNTAIN,  "Mountain",   ROW_MOUNTAIN,  -96,  54);
+    make_bubble(ui.bub_attach,   ICON_ATTACH,    "Attachment", ROW_ATTACH,      0,  54);
+    make_bubble(ui.bub_pulley,   ICON_PULLEY,    "Pulley",     ROW_PULLEY,     96,  54);
 
     // Done sits in the gap at the bottom of the ring.
     ui.btn_settings_done = make_action_button(ui.scr_settings, "DONE");
@@ -1775,8 +1877,15 @@ void refresh_value()
     char unit[4] = "lb";
     if (ui.screen == Screen::AdjustAttach) {
         const int base = ui.weight * (ui.st.twinned() ? 2 : 1);
-        lv_label_set_text_fmt(ui.lbl_val_info, "Total #" C_WHITE_HEX " %d lb#\nwith the Voltra's %d",
-                              base + v, base);
+        // Through a pulley the handle carries the Voltra's weight times its ratio.
+        char total[12];
+        format_x2(total, sizeof(total), handle_x2(base) + 2 * v, false);
+        if (pulley_on()) {
+            lv_label_set_text_fmt(ui.lbl_val_info, "Total #" C_WHITE_HEX " %s lb#\nwith the Voltra's %d x %s",
+                                  total, base, pulley_label());
+        } else {
+            lv_label_set_text_fmt(ui.lbl_val_info, "Total #" C_WHITE_HEX " %s lb#\nwith the Voltra's %d", total, base);
+        }
     } else {
         snprintf(unit, sizeof(unit), "%s", accessory_unit());
         const int mx = ecc ? ecc_max() : chains_max();
@@ -2420,13 +2529,14 @@ void demo_loaded(DeviceState &s, int workout_status, uint8_t phase, uint16_t rep
     s.force_lb = 45;
 }
 
-/** Back to the real Voltra, its scan results and the saved attachment weight. */
+/** Back to the real Voltra, its scan results and the saved attachment and pulley. */
 void demo_off()
 {
     ui.demo = false;
     ui.last_dev_version = 0xFFFFFFFF;
     ui.last_state_version = 0xFFFFFFFF;
     load_attach();   // undo any "set attach"
+    load_pulley();   // and "set pulley"
 }
 
 bool run_command(const char *cmd)
@@ -2517,6 +2627,7 @@ bool run_command(const char *cmd)
         DeviceState &s = ui.demo_st;
         if (s.conn != ConnState::Ready) s = demo_base();
         if (!strcmp(arg, "attach")) ui.attach = clampi(n, 0, MAX_ATTACH_LB);
+        else if (!strcmp(arg, "pulley")) ui.pulley_x2 = n == 2 ? 4 : n == 0 ? 1 : 2;   // 2, 1 or 0.5 (read as 0)
         else if (!strcmp(arg, "ecc")) s.eccentric_lb = n;
         else if (!strcmp(arg, "chains")) s.chains_lb = n;
         else if (!strcmp(arg, "weight")) s.weight = n;
@@ -2553,6 +2664,7 @@ void ui_init()
     build_connect();
     lv_scr_load(ui.scr_main);
     load_attach();
+    load_pulley();
     ui.last_input_ms = millis();
     ui.st = vc().state();
     ui.last_load_refused = ui.st.load_refused;
