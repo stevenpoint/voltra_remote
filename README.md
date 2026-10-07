@@ -151,6 +151,34 @@ twinning (the way Beyond+ does it; see `docs/PROTOCOL.md`, "Twin mode").
 If the watch loses the host while twinned it keeps retrying; reconnecting can take a
 minute or so, and if it does not, un-twin on the Voltras and set the twin up again.
 
+## On the knob
+
+The same code also builds for the Waveshare
+[ESP32-S3-Knob-Touch-LCD-1.8](https://www.waveshare.com/wiki/ESP32-S3-Knob-Touch-LCD-1.8),
+the board the original remote was made for. Turning the knob does what swiping does on the
+watch: 1 lb steps turned slowly, 5 lb steps spun fast. The knob keeps the original
+remote's screen layout. The Voltra code is the same on both, so twin mode, two Voltras
+at once and the Connect screen work there too: tap the top of the screen to open it.
+
+On Windows, one command in PowerShell installs what it needs (Python, PlatformIO), downloads
+the code, flashes the knob and offers to take screenshots of every screen:
+
+```
+irm https://raw.githubusercontent.com/stevenpoint/voltra_remote/watch206/tools/install_knob.ps1 | iex
+```
+
+Otherwise follow steps 1, 2 and 5 above, with this in place of step 3:
+
+```
+pio run -e remote -t upload
+```
+
+The knob has two chips behind a USB switch. If the computer sees a CH340 serial port
+rather than an Espressif USB device (`303A:1001`), flip the USB-C plug over.
+
+On Windows, build from PowerShell or cmd, not Git Bash: the toolchain does not install
+under MSYS, and the build then fails with `'xtensa-esp32s3-elf-gcc' is not recognized`.
+
 ## Safety
 
 - The watch only loads when you tap, hold or confirm the override. It never loads on

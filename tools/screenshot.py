@@ -46,6 +46,8 @@ ALL = [
     ("adjust_chains", ["show chains"]),
     ("adjust_attachment", ["show attach"]),
     ("connect", ["show connect"]),
+    ("connect_devices", ["demo idle", "demo devs", "show connect"]),
+    ("connect_twin", ["demo twin", "demo devs", "show connect"]),
 ]
 RESTORE = ["set ecc 0", "set chains 0", "demo off", "show main"]
 
