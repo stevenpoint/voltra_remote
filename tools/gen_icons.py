@@ -11,6 +11,7 @@ and recolour them like text.
   U+E004  settings        five dots in a plus (the Voltra's settings button)
   U+E005  attachment      a barbell seen side on: a bar through two plates each end
   U+E006  pulley          a wheel on a hook, the cable running down both sides
+  U+E007  drop sets       three bars stepping down, the weight dropping in stages
 
 Shapes are drawn in their own design units at high resolution, then box-filtered
 down to the target size. Needs Pillow.
@@ -140,6 +141,14 @@ def draw_pulley(draw, s):
         draw.rectangle([(sx * r - t / 2) * s, 0, (sx * r + t / 2) * s, 230 * s], fill=255)
 
 
+def draw_drop_sets(draw, s):
+    w, gap = 80, 36   # bar width and the space between bars
+    for i, h in enumerate((300, 200, 110)):
+        x = (i - 1) * (w + gap)
+        draw.rounded_rectangle([(x - w / 2) * s, (150 - h) * s, (x + w / 2) * s, 150 * s],
+                               radius=12 * s, fill=255)
+
+
 # (label, draw function, max width px, max height px) at the 26 px design size; other
 # sizes scale these
 ICONS = [
@@ -150,6 +159,7 @@ ICONS = [
     ("settings", draw_settings, 24, 24),
     ("attachment", draw_attachment, 27, 18),
     ("pulley", draw_pulley, 22, 24),
+    ("drop sets", draw_drop_sets, 24, 22),
 ]
 
 

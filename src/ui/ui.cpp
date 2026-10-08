@@ -13,6 +13,7 @@
 #include "hw/display.h"
 #include "hw/haptics.h"
 #include "hw/knob.h"
+#include "ui/drop_sets.h"
 #include "ui/knob_step.h"
 #include "voltra/voltra_client.h"
 
@@ -55,8 +56,11 @@ namespace {
 #define ICON_SETTINGS  "\xEE\x80\x84"   // U+E004
 #define ICON_ATTACH    "\xEE\x80\x85"   // U+E005
 #define ICON_PULLEY    "\xEE\x80\x86"   // U+E006
+#define ICON_DROP      "\xEE\x80\x87"   // U+E007
 #define C_ATTACH   lv_color_hex(0x38bdf8)
 #define C_ATTACH_HEX "38bdf8"
+#define C_DROP     lv_color_hex(0x2dd4bf)
+#define C_DROP_HEX "2dd4bf"
 
 // Knob stepping (fine/coarse selection and snapping) lives in ui/knob_step.h.
 using knobstep::apply_step;
@@ -84,7 +88,14 @@ constexpr uint32_t DEMO_TIMEOUT_MS = 2 * 60 * 1000;
 // After asking two connected Voltras to pair, how long to wait for the host to report it.
 constexpr uint32_t PAIR_WINDOW_MS = 30000;
 
-enum class Screen { Main, Settings, AdjustChains, AdjustEcc, AdjustAttach, Connect };
+// Drop set choices (ui/drop_sets.h), kept on this device (NVS) for both Voltras.
+using dropsets::Mode;
+constexpr uint8_t DROP_COUNTS[] = {1, 2, 3, 4};
+constexpr uint8_t DROP_PERCENTS[] = {5, 10, 15, 20, 25, 30, 40, 50};
+constexpr uint8_t DROP_EVERY[] = {2, 4, 6, 8, 10, 12, 15, 20};   // reps, rep target only
+template <typename T, size_t N> constexpr uint8_t count_of(const T (&)[N]) { return (uint8_t)N; }
+
+enum class Screen { Main, Settings, AdjustChains, AdjustEcc, AdjustAttach, DropSets, Connect };
 
 /**
  * Chains, inverse chains and mountain are one accessory in three styles: the Voltra
@@ -101,8 +112,12 @@ enum SettingsRow : intptr_t {
     ROW_MOUNTAIN,
     ROW_ATTACH,
     ROW_PULLEY,
+    ROW_DROPS,
     ROW_CLOSE,
 };
+
+/** Rows of the drop sets screen, stored in each row's user data. */
+enum DropRow : intptr_t { DROP_ROW_MODE, DROP_ROW_COUNT, DROP_ROW_PERCENT, DROP_ROW_EVERY, DROP_ROWS, DROP_ROW_BACK = -1 };
 
 struct Ui {
     // main
@@ -155,8 +170,13 @@ struct Ui {
         lv_obj_t *title = nullptr;
         lv_obj_t *value = nullptr;
     };
-    Bubble bub_ecc, bub_chains, bub_mountain, bub_inverse, bub_attach, bub_pulley;
+    Bubble bub_ecc, bub_chains, bub_mountain, bub_inverse, bub_attach, bub_pulley, bub_drop;
     lv_obj_t *btn_settings_done = nullptr;
+
+    // drop sets: one row per choice, a tap steps through its values
+    lv_obj_t *scr_drops = nullptr;
+    lv_obj_t *drop_row[DROP_ROWS] = {}, *drop_val[DROP_ROWS] = {};
+    lv_obj_t *lbl_drop_info = nullptr;
 
     // eccentric / chains / attachment (watch): the amount, a slider and quick picks
     lv_obj_t *scr_value = nullptr;
@@ -215,6 +235,10 @@ struct Ui {
     bool ecc_learned = false;
     uint8_t last_rep_phase = 0;
     uint8_t shown_phase = 0;   // rep phase on screen: 1 pull, 3 return, held through the others
+
+    // Drop sets: the choices (indexes into DROP_*), and how far this load has got.
+    uint8_t drop_mode = dropsets::OFF, drop_count_i = 1, drop_pct_i = 3, drop_every_i = 3;
+    dropsets::Tracker drops;
 
     knobstep::RateTracker knob_rate;
 
@@ -357,6 +381,7 @@ lv_obj_t *screen_obj(Screen s)
         case Screen::AdjustEcc:
         case Screen::AdjustAttach: return ui.scr_adjust;
 #endif
+        case Screen::DropSets: return ui.scr_drops;
         case Screen::Connect: return ui.scr_connect;
         default: return ui.scr_main;
     }
@@ -861,6 +886,70 @@ void save_pulley()
     p.end();
 }
 
+/** Drop set choices, one setting for both Voltras. Out-of-range values fall back to the defaults. */
+void load_drops()
+{
+    ui.drop_mode = dropsets::OFF;
+    ui.drop_count_i = 1;   // 2 drops
+    ui.drop_pct_i = 3;     // 20%
+    ui.drop_every_i = 3;   // every 8 reps
+    Preferences p;
+    if (!p.begin(PRESET_NS, true)) return;
+    const uint8_t mode = p.getUChar("drop_mode", dropsets::OFF);
+    const uint8_t count = p.getUChar("drop_count", 1);
+    const uint8_t pct = p.getUChar("drop_pct", 3);
+    const uint8_t every = p.getUChar("drop_every", 3);
+    p.end();
+    if (mode < dropsets::MODE_COUNT) ui.drop_mode = mode;
+    if (count < count_of(DROP_COUNTS)) ui.drop_count_i = count;
+    if (pct < count_of(DROP_PERCENTS)) ui.drop_pct_i = pct;
+    if (every < count_of(DROP_EVERY)) ui.drop_every_i = every;
+}
+
+void save_drops()
+{
+    Preferences p;
+    if (!p.begin(PRESET_NS, false)) return;
+    const struct { const char *key; uint8_t v; } vals[] = {
+        {"drop_mode", ui.drop_mode}, {"drop_count", ui.drop_count_i},
+        {"drop_pct", ui.drop_pct_i}, {"drop_every", ui.drop_every_i},
+    };
+    for (const auto &e : vals) {
+        if (p.getUChar(e.key, 0xFF) != e.v) p.putUChar(e.key, e.v);
+    }
+    p.end();
+}
+
+int drop_count() { return DROP_COUNTS[ui.drop_count_i]; }
+
+/** "2x 20%, 8 reps", "2x 20%, each set", or "Off" (watch settings list). */
+[[maybe_unused]] void drop_summary(char *buf, size_t n)
+{
+    if (ui.drop_mode == dropsets::OFF) {
+        snprintf(buf, n, "Off");
+    } else if (ui.drop_mode == dropsets::REP_TARGET) {
+        snprintf(buf, n, "%dx %d%%, %d reps", drop_count(), DROP_PERCENTS[ui.drop_pct_i], DROP_EVERY[ui.drop_every_i]);
+    } else {
+        snprintf(buf, n, "%dx %d%%, each set", drop_count(), DROP_PERCENTS[ui.drop_pct_i]);
+    }
+}
+
+/**
+ * Drop sets, run on each state change of the Voltra on screen (ui/drop_sets.h). A drop is
+ * the weight less its percent, sent like a turn of the knob, so a drop during a set keeps
+ * the set going (Client::setWeight re-asserts it). Never on the stand-in Voltra.
+ */
+void update_drops()
+{
+    const DeviceState &st = ui.st;
+    const dropsets::Sample s = {st.loaded(), ui.set_active, st.workout_status == voltra::WORKOUT_STATUS_RESTING,
+                                (int)st.reps};
+    const Mode mode = ui.demo ? dropsets::OFF : (Mode)ui.drop_mode;
+    if (!ui.drops.step(mode, drop_count(), DROP_EVERY[ui.drop_every_i], s)) return;
+    set_weight(dropsets::dropped_weight(ui.weight, DROP_PERCENTS[ui.drop_pct_i]));   // clamped to the minimum
+    haptics_double();
+}
+
 /** Put the other Voltra on screen. Edits not yet sent go to the one being left. */
 void switch_to(int slot)
 {
@@ -873,6 +962,7 @@ void switch_to(int slot)
     ui.toggle_pending_until = ui.auto_load_pending_until = ui.load_refused_until = 0;
     ui.set_active = ui.ecc_learned = false;
     ui.last_rep_phase = ui.shown_phase = 0;
+    ui.drops.reset();   // drop sets start over on the other Voltra
     ui.last_display = -2;
     ui.last_state_version = ui.last_other_version = 0xFFFFFFFF;
     std::swap(ui.st, ui.st_other);
@@ -1154,21 +1244,27 @@ void refresh_main()
     // force between sets, else what the weight is made of.
     if (!set_mode) ui.shown_phase = 0;
     else if (st.rep_phase == 1 || st.rep_phase == 3) ui.shown_phase = st.rep_phase;   // else keep
+    // Drop sets on: how many of this load's drops have been made, after the rep phase.
+    char drops[40] = "";
+    if (ui.drop_mode != dropsets::OFF) {
+        snprintf(drops, sizeof(drops), "#" C_DROP_HEX " DROP %d/%d#", ui.drops.done, drop_count());
+    }
     if (set_mode) {
 #ifdef WATCH206
+        const char *gap = drops[0] ? "    " : "";
         if (ui.shown_phase == 3 && ecc_phase) {
             char ecc[12];
             format_x2(ecc, sizeof(ecc), handle_x2(amount_lb(ui.ecc) * per_unit_x), true);
             lv_label_set_text_fmt(ui.lbl_reps, LV_SYMBOL_DOWN "  Return    %s eccentric", ecc);
         } else if (ui.shown_phase == 3) {
-            lv_label_set_text(ui.lbl_reps, LV_SYMBOL_DOWN "  Return");
+            lv_label_set_text_fmt(ui.lbl_reps, LV_SYMBOL_DOWN "  Return%s%s", gap, drops);
         } else if (ui.shown_phase == 1) {
-            lv_label_set_text(ui.lbl_reps, LV_SYMBOL_UP "  Pull");
+            lv_label_set_text_fmt(ui.lbl_reps, LV_SYMBOL_UP "  Pull%s%s", gap, drops);
         } else {
-            lv_label_set_text(ui.lbl_reps, "");
+            lv_label_set_text(ui.lbl_reps, drops);
         }
 #else
-        lv_label_set_text(ui.lbl_reps, "");
+        lv_label_set_text(ui.lbl_reps, drops);
 #endif
     } else if (ready && loaded && (st.reps > 0 || st.sets > 0)) {
         lv_label_set_text_fmt(ui.lbl_reps, "SET %u   REP %u", (unsigned)st.sets, (unsigned)st.reps);
@@ -1338,6 +1434,7 @@ void on_top_clicked(lv_event_t *)
 void on_gear_clicked(lv_event_t *);
 void refresh_settings();
 void refresh_adjust();
+void refresh_drops();
 
 /** Tapping a chip goes straight to that accessory's dial, and Done comes back here. */
 void on_chip_clicked(lv_event_t *e)
@@ -1685,6 +1782,10 @@ void on_settings_row(lv_event_t *e)
             refresh_settings();
             break;
         }
+        case ROW_DROPS:
+            show(Screen::DropSets);
+            refresh_drops();
+            break;
         case ROW_CLOSE:
         default:
             show(Screen::Main);
@@ -1719,7 +1820,7 @@ void make_bubble(Ui::Bubble &b, lv_obj_t *list, const char *icon, lv_color_t col
 {
     b.btn = lv_btn_create(list);
     lv_obj_remove_style_all(b.btn);
-    lv_obj_set_size(b.btn, LV_PCT(100), 56);
+    lv_obj_set_size(b.btn, LV_PCT(100), 48);
     lv_obj_set_style_radius(b.btn, 20, 0);
     lv_obj_set_style_bg_color(b.btn, C_CARD, 0);
     lv_obj_set_style_bg_opa(b.btn, LV_OPA_COVER, 0);
@@ -1778,7 +1879,7 @@ void set_bubble(Ui::Bubble &b, const char *value, bool active, lv_color_t colour
 
 void refresh_settings()
 {
-    char buf[16];
+    char buf[24];
 
     if (ui.ecc != 0) format_amount(buf, sizeof(buf), ui.ecc, true);
     else snprintf(buf, sizeof(buf), "%s", SETTING_OFF);
@@ -1803,6 +1904,21 @@ void refresh_settings()
 
     // Never off: 1:1 is muted, like an accessory that is off.
     set_bubble(ui.bub_pulley, pulley_label(), pulley_on(), C_LOADED);
+
+    // drop sets
+    const bool drops_on = ui.drop_mode != dropsets::OFF;
+#ifdef WATCH206
+    drop_summary(buf, sizeof(buf));
+    set_bubble(ui.bub_drop, buf, drops_on, C_DROP);
+#else
+    // a pill over the bubbles: its title, and the drop when on
+    if (drops_on) snprintf(buf, sizeof(buf), "DROP %dx %d%%", drop_count(), DROP_PERCENTS[ui.drop_pct_i]);
+    else snprintf(buf, sizeof(buf), "DROP SETS");
+    lv_label_set_text(ui.bub_drop.title, buf);
+    lv_obj_set_style_border_color(ui.bub_drop.btn, drops_on ? C_DROP : C_TRACK, 0);
+    lv_obj_set_style_text_color(ui.bub_drop.icon, drops_on ? C_DROP : C_TEXT, 0);
+    lv_obj_set_style_text_color(ui.bub_drop.title, drops_on ? C_DROP : C_TEXT, 0);
+#endif
 }
 
 void build_settings()
@@ -1815,8 +1931,8 @@ void build_settings()
     lv_obj_set_size(list, 366, LV_SIZE_CONTENT);
     lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    // Six rows of 56 end 50 px above the bottom, clear of the panel's rounded corners.
-    lv_obj_set_style_pad_row(list, 6, 0);
+    // Seven rows of 48 end 50 px above the bottom, clear of the panel's rounded corners.
+    lv_obj_set_style_pad_row(list, 5, 0);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 86);
     make_bubble(ui.bub_attach,   list, ICON_ATTACH,    C_ATTACH, "Attachment",     ROW_ATTACH);
     make_bubble(ui.bub_ecc,      list, ICON_ECCENTRIC, C_ECC,    "Eccentric",      ROW_ECCENTRIC);
@@ -1824,13 +1940,30 @@ void build_settings()
     make_bubble(ui.bub_inverse,  list, ICON_INVERSE,   C_CHAINS, "Inverse chains", ROW_INVERSE);
     make_bubble(ui.bub_mountain, list, ICON_MOUNTAIN,  C_WARN,   "Mountain",       ROW_MOUNTAIN);
     make_bubble(ui.bub_pulley,   list, ICON_PULLEY,    C_LOADED, "Pulley",         ROW_PULLEY);
+    make_bubble(ui.bub_drop,     list, ICON_DROP,      C_DROP,   "Drop sets",      ROW_DROPS);
 #else
     lv_obj_t *ring = make_ring(ui.scr_settings, C_TRACK);
     lv_arc_set_value(ring, 0);
 
-    lv_obj_t *title = make_label(ui.scr_settings, &font_poppins_18, C_TEXT, "SETTINGS");
-    lv_obj_set_style_text_letter_space(title, 2, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+    // Drop sets: a pill where the title would be, over the bubbles (which start at y 94).
+    // Inside the ring: its straight sides start 115 px above centre, 82 px out, where the
+    // ring's inside edge is 108 px out.
+    ui.bub_drop.btn = make_pill_button(ui.scr_settings, 164, 38, C_TRACK, "", nullptr);
+    lv_obj_align(ui.bub_drop.btn, LV_ALIGN_TOP_MID, 0, 46);
+    lv_obj_set_ext_click_area(ui.bub_drop.btn, 6);
+    lv_obj_set_user_data(ui.bub_drop.btn, (void *)(intptr_t)ROW_DROPS);
+    lv_obj_add_event_cb(ui.bub_drop.btn, on_settings_row, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *drop_row = lv_obj_create(ui.bub_drop.btn);
+    lv_obj_remove_style_all(drop_row);
+    lv_obj_set_size(drop_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(drop_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(drop_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(drop_row, 8, 0);
+    lv_obj_clear_flag(drop_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(drop_row);
+    ui.bub_drop.icon = make_label(drop_row, &font_icons_18, C_TEXT, ICON_DROP);
+    ui.bub_drop.title = make_label(drop_row, &font_poppins_14, C_TEXT, "DROP SETS");
+    lv_obj_set_style_text_letter_space(ui.bub_drop.title, 1, 0);
 
     // Three over three: eccentric, chains, inverse chains / mountain, attachment, pulley.
     // Kept inside the ring: the farthest bubble edge is ~154 px from centre against the
@@ -1846,6 +1979,114 @@ void build_settings()
     ui.btn_settings_done = make_action_button(ui.scr_settings, "DONE");
     lv_obj_set_user_data(ui.btn_settings_done, (void *)(intptr_t)ROW_CLOSE);
     lv_obj_add_event_cb(ui.btn_settings_done, on_settings_row, LV_EVENT_CLICKED, nullptr);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Drop sets screen: mode, number of drops, percent per drop, reps between drops. A tap
+// on a row steps through its values, as the pulley row does.
+// ---------------------------------------------------------------------------
+void on_drop_row(lv_event_t *e)
+{
+    const intptr_t row = (intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+    haptics_click();
+    switch (row) {
+        case DROP_ROW_MODE: ui.drop_mode = (ui.drop_mode + 1) % dropsets::MODE_COUNT; break;
+        case DROP_ROW_COUNT: ui.drop_count_i = (ui.drop_count_i + 1) % count_of(DROP_COUNTS); break;
+        case DROP_ROW_PERCENT: ui.drop_pct_i = (ui.drop_pct_i + 1) % count_of(DROP_PERCENTS); break;
+        case DROP_ROW_EVERY: ui.drop_every_i = (ui.drop_every_i + 1) % count_of(DROP_EVERY); break;
+        default:   // back / done
+            show(Screen::Settings);
+            refresh_settings();
+            return;
+    }
+    save_drops();
+    refresh_drops();
+}
+
+void refresh_drops()
+{
+    static const char *const modes[dropsets::MODE_COUNT] = {"Off", "Rep target", "Set down"};
+    const bool on = ui.drop_mode != dropsets::OFF;
+    lv_label_set_text(ui.drop_val[DROP_ROW_MODE], modes[ui.drop_mode]);
+    lv_label_set_text_fmt(ui.drop_val[DROP_ROW_COUNT], "%d", drop_count());
+    lv_label_set_text_fmt(ui.drop_val[DROP_ROW_PERCENT], "%d%%", DROP_PERCENTS[ui.drop_pct_i]);
+    lv_label_set_text_fmt(ui.drop_val[DROP_ROW_EVERY], "%d reps", DROP_EVERY[ui.drop_every_i]);
+    lv_obj_set_style_text_color(ui.drop_val[DROP_ROW_MODE], on ? C_DROP : C_MUTED, 0);
+    for (int i = DROP_ROW_COUNT; i < DROP_ROWS; i++) {
+        // dimmed while off, and "every" only counts for rep target
+        const bool used = on && (i != DROP_ROW_EVERY || ui.drop_mode == dropsets::REP_TARGET);
+        lv_obj_set_style_opa(ui.drop_row[i], used ? LV_OPA_COVER : LV_OPA_40, 0);
+    }
+    if (ui.lbl_drop_info) {
+        const int pct = DROP_PERCENTS[ui.drop_pct_i];
+        if (ui.drop_mode == dropsets::REP_TARGET) {
+            lv_label_set_text_fmt(ui.lbl_drop_info, "The weight drops %d%% after every %d reps,\nup to %d times per load",
+                                  pct, DROP_EVERY[ui.drop_every_i], drop_count());
+        } else if (ui.drop_mode == dropsets::SET_DOWN) {
+            lv_label_set_text_fmt(ui.lbl_drop_info, "The weight drops %d%% each time a set ends,\nup to %d times per load",
+                                  pct, drop_count());
+        } else {
+            lv_label_set_text(ui.lbl_drop_info, "Tap Mode to drop the weight\nduring or between sets");
+        }
+    }
+}
+
+void make_drop_row(lv_obj_t *parent, int i, const char *title, int w, int h)
+{
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(b, C_CARD, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(b, C_TRACK, LV_STATE_PRESSED);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_user_data(b, (void *)(intptr_t)i);
+    lv_obj_add_event_cb(b, on_drop_row, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *t = make_label(b, &font_poppins_16, C_MUTED, title);
+    lv_obj_align(t, LV_ALIGN_LEFT_MID, 22, 1);
+    ui.drop_val[i] = make_label(b, &font_poppins_18, C_TEXT, "");
+    lv_obj_align(ui.drop_val[i], LV_ALIGN_RIGHT_MID, -22, 1);
+    ui.drop_row[i] = b;
+}
+
+void build_drops()
+{
+    static const char *const titles[DROP_ROWS] = {"Mode", "Drops", "Drop by", "Every"};
+    ui.scr_drops = make_screen();
+#ifdef WATCH206
+    make_header(ui.scr_drops, "Drop sets", C_DROP, on_drop_row, DROP_ROW_BACK);
+    lv_obj_t *list = lv_obj_create(ui.scr_drops);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, 366, LV_SIZE_CONTENT);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list, 6, 0);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 86);
+    for (int i = 0; i < DROP_ROWS; i++) make_drop_row(list, i, titles[i], LV_PCT(100), 56);
+    // what the choices add up to, under the rows (which end at y 328)
+    ui.lbl_drop_info = make_label(ui.scr_drops, &font_poppins_16, C_MUTED, "");
+    lv_obj_set_width(ui.lbl_drop_info, 340);
+    lv_obj_set_style_text_align(ui.lbl_drop_info, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(ui.lbl_drop_info, 4, 0);
+    lv_obj_align(ui.lbl_drop_info, LV_ALIGN_TOP_MID, 0, 352);
+#else
+    lv_obj_t *ring = make_ring(ui.scr_drops, C_TRACK);
+    lv_arc_set_value(ring, 0);
+    lv_obj_t *title = make_label(ui.scr_drops, &font_poppins_18, C_DROP, "DROP SETS");
+    lv_obj_set_style_text_letter_space(title, 2, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+    // Four rows of 240 x 44, 50 apart about the centre. Inside the ring: the outer rows'
+    // far edges are 97 px from centre, where the ring's inside is 124 px either side.
+    for (int i = 0; i < DROP_ROWS; i++) {
+        make_drop_row(ui.scr_drops, i, titles[i], 240, 44);
+        lv_obj_align(ui.drop_row[i], LV_ALIGN_CENTER, 0, -75 + 50 * i);
+    }
+    lv_obj_t *done = make_action_button(ui.scr_drops, "DONE");
+    lv_obj_set_user_data(done, (void *)(intptr_t)DROP_ROW_BACK);
+    lv_obj_add_event_cb(done, on_drop_row, LV_EVENT_CLICKED, nullptr);
 #endif
 }
 
@@ -2252,7 +2493,8 @@ void handle_knob(int delta)
             }
             break;
         case Screen::Settings:
-            break;   // all the bubbles are visible at once; selection is by touch
+        case Screen::DropSets:
+            break;   // everything is visible at once; selection is by touch
         case Screen::Connect:
             lv_obj_scroll_by(ui.list, 0, -delta * 44, LV_ANIM_ON);
             break;
@@ -2395,6 +2637,7 @@ void poll_cb(lv_timer_t *)
             if (mode == voltra::FITNESS_MODE_STRENGTH_IDLE) ui.set_active = false;
             else if (moving) ui.set_active = true;
         }
+        update_drops();
     }
     if (ui.auto_load_pending_until && (ui.st.auto_loading() || ui.st.loaded())) {
         ui.auto_load_pending_until = 0;   // the Voltra has taken over
@@ -2430,6 +2673,8 @@ void poll_cb(lv_timer_t *)
         case Screen::Settings:
             if (state_changed) refresh_settings();
             break;
+        case Screen::DropSets:
+            break;   // nothing on it comes from the Voltra
         case Screen::AdjustChains:
         case Screen::AdjustEcc:
         case Screen::AdjustAttach:
@@ -2537,6 +2782,7 @@ void demo_off()
     ui.last_state_version = 0xFFFFFFFF;
     load_attach();   // undo any "set attach"
     load_pulley();   // and "set pulley"
+    load_drops();    // and "set drops"
 }
 
 bool run_command(const char *cmd)
@@ -2556,6 +2802,7 @@ bool run_command(const char *cmd)
         const struct { const char *name; Screen s; } screens[] = {
             {"main", Screen::Main}, {"settings", Screen::Settings}, {"ecc", Screen::AdjustEcc},
             {"chains", Screen::AdjustChains}, {"attach", Screen::AdjustAttach}, {"connect", Screen::Connect},
+            {"drops", Screen::DropSets},
         };
         for (const auto &e : screens) {
             if (strcmp(arg, e.name)) continue;
@@ -2567,6 +2814,7 @@ bool run_command(const char *cmd)
             if (e.s == Screen::Main) refresh_main();
             else if (e.s == Screen::Settings) refresh_settings();
             else if (e.s == Screen::Connect) { rebuild_device_list(); refresh_connect(); }
+            else if (e.s == Screen::DropSets) refresh_drops();
             else refresh_adjust();
             return true;
         }
@@ -2632,6 +2880,7 @@ bool run_command(const char *cmd)
         else if (!strcmp(arg, "chains")) s.chains_lb = n;
         else if (!strcmp(arg, "weight")) s.weight = n;
         else if (!strcmp(arg, "reps")) s.reps = (uint16_t)n;
+        else if (!strcmp(arg, "drops")) ui.drop_mode = (uint8_t)clampi(n, 0, dropsets::MODE_COUNT - 1);
         else return false;
         ui.last_state_version = 0xFFFFFFFF;
         return true;
@@ -2661,10 +2910,12 @@ void ui_init()
 #else
     build_adjust();
 #endif
+    build_drops();
     build_connect();
     lv_scr_load(ui.scr_main);
     load_attach();
     load_pulley();
+    load_drops();
     ui.last_input_ms = millis();
     ui.st = vc().state();
     ui.last_load_refused = ui.st.load_refused;

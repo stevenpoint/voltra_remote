@@ -34,7 +34,7 @@ Screenshots come straight off the watch (`tools/screenshot.py`).
 | Hold the weight | Voltra auto load (pull and hold the cable, 3 s countdown) |
 | Tap again on "CABLE OUT: TAP TO OVERRIDE" | Load at once with the cable pulled out |
 | Swipe up / down | Weight +/- 1 lb, 5 lb steps when swiping fast |
-| Gear button | Settings: attachment, eccentric, chains, inverse chains, mountain, pulley |
+| Gear button | Settings: attachment, eccentric, chains, inverse chains, mountain, pulley, drop sets |
 | Tap an accessory dial under the weight | Adjust that accessory |
 | Tap the Bluetooth bar at the top | Connect screen: connect one or two Voltras, pair, un-twin |
 | Two Voltras connected: tap the other one in the top bar | Control that Voltra |
@@ -53,6 +53,21 @@ the Voltra and the handle. It is also display only: at 2:1 the weight, the live 
 the eccentric on the way back show what the handle carries, twice the Voltra's, and the
 ratio shows over the unit. 0.5:1 halves them. The Voltra is still sent its own weight.
 One setting for both Voltras, remembered across restarts.
+
+**Drop sets** lower the weight by a percent of itself during a load, the way
+[marvaments/voltra-knob-controller](https://github.com/marvaments/voltra-knob-controller)
+does. On the Drop sets screen (Settings), tap a row to step through its values:
+
+- **Mode**: off, **rep target** (drop after every so many reps of a set: with 8, after
+  reps 8, 16...) or **set down** (drop each time a set ends and the Voltra rests).
+- **Drops**: 1 to 4 per load. Loading again starts them over.
+- **Drop by**: 5 to 50% of the weight at the time, so 100 lb at 20% goes to 80, then 64.
+- **Every**: 2 to 20 reps, for rep target.
+
+Only the weight drops; chains and eccentric stay as they are. A drop during a set keeps
+the set going, and the knob clicks twice. During a set, the line under the
+weight shows how many drops have been made. One setting for both Voltras, remembered
+across restarts.
 
 The watch switches itself off after 10 minutes without a touch, unless the Voltra is
 loaded or the watch is plugged in. The side button turns it back on.
@@ -159,6 +174,7 @@ the board the original remote was made for. Turning the knob does what swiping d
 watch: 1 lb steps turned slowly, 5 lb steps spun fast. The knob keeps the original
 remote's screen layout. The Voltra code is the same on both, so twin mode, two Voltras
 at once and the Connect screen work there too: tap the top of the screen to open it.
+Drop sets are the **DROP SETS** button at the top of the Settings screen.
 
 On Windows, one command in PowerShell installs what it needs (Python, Git, PlatformIO), downloads
 the code, flashes the knob and offers to take screenshots of every screen:

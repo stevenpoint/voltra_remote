@@ -10,6 +10,7 @@
 
 #include <unity.h>
 
+#include "ui/drop_sets.h"
 #include "ui/knob_step.h"
 #include "voltra/voltra_protocol.h"
 
@@ -484,6 +485,87 @@ void test_direction_reversal_keeps_stepping_sane()
     TEST_ASSERT_EQUAL_INT(99, v);
 }
 
+// --- Drop sets (ui/drop_sets.h) ---------------------------------------------------------
+
+/** Feed one sample; true when a drop is due. */
+static bool drop_step(dropsets::Tracker &t, dropsets::Mode m, bool loaded, bool active, bool resting, int reps,
+                      int max_drops = 2, int every = 8)
+{
+    return t.step(m, max_drops, every, dropsets::Sample{loaded, active, resting, reps});
+}
+
+void test_drop_rep_target_every_n_reps()
+{
+    dropsets::Tracker t;
+    const auto m = dropsets::REP_TARGET;
+    TEST_ASSERT_FALSE(drop_step(t, m, true, false, false, 0));   // loaded, no rep yet
+    for (int r = 1; r <= 7; r++) TEST_ASSERT_FALSE(drop_step(t, m, true, true, false, r));
+    TEST_ASSERT_TRUE(drop_step(t, m, true, true, false, 8));
+    TEST_ASSERT_FALSE(drop_step(t, m, true, true, false, 8));    // same rep again: no second drop
+    for (int r = 9; r <= 15; r++) TEST_ASSERT_FALSE(drop_step(t, m, true, true, false, r));
+    TEST_ASSERT_TRUE(drop_step(t, m, true, true, false, 16));
+    TEST_ASSERT_FALSE(drop_step(t, m, true, true, false, 24));   // both drops used
+    TEST_ASSERT_EQUAL_INT(2, t.done);
+}
+
+void test_drop_rep_target_needs_a_set_and_a_new_rep()
+{
+    dropsets::Tracker t;
+    const auto m = dropsets::REP_TARGET;
+    // Loaded with the count from an earlier load still showing: not a new rep.
+    TEST_ASSERT_FALSE(drop_step(t, m, true, true, false, 12));
+    // A rep counted while no set is under way does not drop either.
+    TEST_ASSERT_FALSE(drop_step(t, m, true, false, true, 13));
+    TEST_ASSERT_TRUE(drop_step(t, m, true, true, false, 14));
+}
+
+void test_drop_set_down_on_rest_not_unload()
+{
+    dropsets::Tracker t;
+    const auto m = dropsets::SET_DOWN;
+    TEST_ASSERT_FALSE(drop_step(t, m, true, false, false, 0));   // loaded, before the first set
+    TEST_ASSERT_FALSE(drop_step(t, m, true, false, true, 0));    // resting without a set: no drop
+    TEST_ASSERT_FALSE(drop_step(t, m, true, true, false, 5));    // set under way
+    TEST_ASSERT_TRUE(drop_step(t, m, true, false, true, 5));     // set ended, resting: drop
+    TEST_ASSERT_FALSE(drop_step(t, m, true, false, true, 5));
+    TEST_ASSERT_FALSE(drop_step(t, m, true, true, false, 1));    // next set
+    TEST_ASSERT_FALSE(drop_step(t, m, true, false, false, 1));   // ended by unloading: no drop
+    TEST_ASSERT_EQUAL_INT(1, t.done);
+}
+
+void test_drop_new_load_starts_over()
+{
+    dropsets::Tracker t;
+    const auto m = dropsets::REP_TARGET;
+    drop_step(t, m, true, false, false, 0);
+    TEST_ASSERT_TRUE(drop_step(t, m, true, true, false, 8, 1));
+    TEST_ASSERT_FALSE(drop_step(t, m, true, true, false, 16, 1));   // the one drop is used
+    drop_step(t, m, false, false, false, 16, 1);                    // unloaded
+    drop_step(t, m, true, false, false, 0, 1);                      // loaded again
+    TEST_ASSERT_EQUAL_INT(0, t.done);
+    TEST_ASSERT_TRUE(drop_step(t, m, true, true, false, 8, 1));
+}
+
+void test_drop_off_and_reset()
+{
+    dropsets::Tracker t;
+    drop_step(t, dropsets::OFF, true, false, false, 0);
+    for (int r = 1; r <= 20; r++) TEST_ASSERT_FALSE(drop_step(t, dropsets::OFF, true, true, false, r));
+    // Switching Voltras mid-set: the set "ending" on the new one is no drop.
+    dropsets::Tracker u;
+    drop_step(u, dropsets::SET_DOWN, true, true, false, 3);
+    u.reset();
+    TEST_ASSERT_FALSE(drop_step(u, dropsets::SET_DOWN, true, false, true, 3));
+}
+
+void test_dropped_weight()
+{
+    TEST_ASSERT_EQUAL_INT(80, dropsets::dropped_weight(100, 20));
+    TEST_ASSERT_EQUAL_INT(64, dropsets::dropped_weight(80, 20));
+    TEST_ASSERT_EQUAL_INT(43, dropsets::dropped_weight(45, 5));    // 42.75 rounds up
+    TEST_ASSERT_EQUAL_INT(3, dropsets::dropped_weight(5, 50));     // 2.5 rounds up
+}
+
 int main(int, char **)
 {
     UNITY_BEGIN();
@@ -518,5 +600,11 @@ int main(int, char **)
     RUN_TEST(test_pause_returns_to_fine);
     RUN_TEST(test_hysteresis_holds_mode_in_the_dead_band);
     RUN_TEST(test_direction_reversal_keeps_stepping_sane);
+    RUN_TEST(test_drop_rep_target_every_n_reps);
+    RUN_TEST(test_drop_rep_target_needs_a_set_and_a_new_rep);
+    RUN_TEST(test_drop_set_down_on_rest_not_unload);
+    RUN_TEST(test_drop_new_load_starts_over);
+    RUN_TEST(test_drop_off_and_reset);
+    RUN_TEST(test_dropped_weight);
     return UNITY_END();
 }
